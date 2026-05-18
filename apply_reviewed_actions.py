@@ -443,11 +443,18 @@ def set_item_folder(base_url: str, token: str, item_id: str, folder_id: str) -> 
 def add_item_tags(
     base_url: str, token: str, item_id: str, tag_ids: list[str]
 ) -> None:
+    """Link tags to an item additively.
+
+    Docspell 0.43.0 has a bug where POST /sec/item/{id}/tags returns 500.
+    The working alternative is PUT /sec/item/{id}/taglink which accepts
+    tag IDs (or names) in the same {"items": [...]} body and adds them
+    without removing existing tags.
+    """
     if not tag_ids:
         return
     request_json(
-        "POST",
-        api_url(base_url, f"/sec/item/{item_id}/tags"),
+        "PUT",
+        api_url(base_url, f"/sec/item/{item_id}/taglink"),
         token=token,
         body={"items": tag_ids},
     )
