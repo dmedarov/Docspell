@@ -1,0 +1,30 @@
+# Outputs and runtime artifacts
+out/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Local-only secrets (precaution — no secrets are committed)
+.env
+.env.*
+*.token
+*.secret
+
+# Browser-extracted enrichment data (may be regenerated)
+out/enrich-batches/
+out/enrich-combined/
+
+# Browser session caches
+out/book-enrichment-cache.json
+
+# Apply logs
+out/apply-log.csv
+
+# Large local zips (delivered via different channel)
+docspell_book_system.zip
+docspell_book_system_enriched.zip
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
