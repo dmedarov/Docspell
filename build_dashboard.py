@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build a standalone HTML dashboard for the Docspell library.
 
-Reads two CSVs:
+Offline build (no network calls). Reads two CSVs:
 - out/docspell-name-classification.csv  (name-based classifier output)
 - docspell_book_system_enriched/out/books-enriched/book-enrichment.csv
   (Open Library + Google Books enrichment)
@@ -17,9 +17,11 @@ Falls back to stdlib csv if pandas isn't installed.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -32,6 +34,11 @@ ENRICHMENT_CSV = (
 OUTPUT_HTML = HERE / "library_dashboard.html"
 
 STRONG_MATCH = 0.78
+
+
+def redact(text: str) -> str:
+    """No-op for the offline dashboard builder — preserved for API symmetry."""
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -766,14 +773,40 @@ if (decadeKeys.length) showDecade(decadeKeys[decadeKeys.length - 1]);
 """
 
 
-def build():
-    if not CLASSIFICATION_CSV.exists():
-        sys.exit(f"Missing: {CLASSIFICATION_CSV}")
-    if not ENRICHMENT_CSV.exists():
-        sys.exit(f"Missing: {ENRICHMENT_CSV}")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build the offline Docspell library dashboard "
+        "(static HTML; no network calls)."
+    )
+    parser.add_argument(
+        "--csv1",
+        default=str(CLASSIFICATION_CSV),
+        help=f"Name-based classification CSV (default: {CLASSIFICATION_CSV})",
+    )
+    parser.add_argument(
+        "--csv2",
+        default=str(ENRICHMENT_CSV),
+        help=f"Open Library + Google Books enrichment CSV (default: {ENRICHMENT_CSV})",
+    )
+    parser.add_argument(
+        "--output",
+        default=str(OUTPUT_HTML),
+        help=f"Output HTML path (default: {OUTPUT_HTML})",
+    )
+    return parser.parse_args()
 
-    classification_rows = load_csv(CLASSIFICATION_CSV)
-    enrichment_rows = load_csv(ENRICHMENT_CSV)
+
+def build(csv1: Path, csv2: Path, output: Path) -> int:
+    if not csv1.exists():
+        print(f"Missing: {csv1}", file=sys.stderr)
+        return 1
+    if not csv2.exists():
+        print(f"Missing: {csv2}", file=sys.stderr)
+        return 1
+
+    start = time.monotonic()
+    classification_rows = load_csv(csv1)
+    enrichment_rows = load_csv(csv2)
 
     payload = build_payload(classification_rows, enrichment_rows)
 
@@ -783,16 +816,31 @@ def build():
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
     ).replace("__BUILD_DATE__", date.today().isoformat())
 
-    OUTPUT_HTML.write_text(html, encoding="utf-8")
-    size_kb = OUTPUT_HTML.stat().st_size / 1024
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(html, encoding="utf-8")
+    elapsed = time.monotonic() - start
+    size_kb = output.stat().st_size / 1024
     print(
-        f"Wrote {OUTPUT_HTML.name} "
+        f"Wrote {output.name} "
         f"({payload['kpi']['classified_rows']} items, "
         f"{payload['kpi']['unique_authors']} authors, "
         f"{payload['kpi']['unique_publishers']} publishers) "
-        f"-> {size_kb:.1f} KB"
+        f"-> {size_kb:.1f} KB in {elapsed * 1000:.0f} ms"
     )
+    return 0
+
+
+def main() -> int:
+    args = parse_args()
+    return build(Path(args.csv1), Path(args.csv2), Path(args.output))
 
 
 if __name__ == "__main__":
-    build()
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("\nCancelled.", file=sys.stderr)
+        raise SystemExit(130)
+    except Exception as exc:
+        print(f"Error: {redact(str(exc))}", file=sys.stderr)
+        raise SystemExit(1)

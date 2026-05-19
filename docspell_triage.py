@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Read-only Docspell triage report generator.
 
-This script only calls Docspell version, login, and item search endpoints.
-It writes local metadata-only outputs and never downloads attachments or OCR text.
+This script is strictly READ-ONLY. It only calls Docspell version, login,
+and item search endpoints (GET + POST /open/auth/login for auth bootstrap).
+It writes local metadata-only outputs and never downloads attachments or
+OCR text. No create/update/delete/tag/move/confirm endpoints are touched.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import sys
 import time
 import urllib.error
@@ -136,17 +139,43 @@ def login(base_url: str, args: argparse.Namespace) -> str:
 
 
 def check_version(base_url: str) -> dict[str, Any]:
+    # The standard Docspell version endpoint is /api/info/version. The
+    # /api/v1/info/version fallback is kept only as a safety net for unusual
+    # reverse-proxy setups. Previously this list included
+    # api_url(base, "/api/info/version") which double-prepends /api/v1 and
+    # produces the nonsense URL /api/v1/api/info/version — fixed below.
+    base = base_url.rstrip("/")
     urls = [
-        f"{base_url.rstrip('/')}/api/info/version",
-        api_url(base_url, "/api/info/version"),
+        f"{base}/api/info/version",
+        f"{base}/api/v1/info/version",
     ]
     last_error: Exception | None = None
     for url in urls:
         try:
             return request_json("GET", url, timeout=20)
-        except Exception as exc:  # Try the alternate documented deployment path.
+        except Exception as exc:
             last_error = exc
     raise RuntimeError(f"Version check failed: {last_error}")
+
+
+def dns_preflight(base_url: str) -> None:
+    """Resolve the URL host before any HTTP traffic. Exits 2 on failure."""
+    try:
+        host = urllib.parse.urlsplit(base_url).hostname
+    except Exception:
+        host = None
+    if not host:
+        return
+    try:
+        socket.gethostbyname(host)
+    except OSError:
+        print(
+            f"DNS resolution failed for {host}.\n"
+            "If on Tailscale: check `tailscale status` or add to /etc/hosts:\n"
+            f"  100.66.18.7  {host}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
 
 
 def search_items(
@@ -426,6 +455,7 @@ def main() -> int:
     base_url = args.url.rstrip("/")
     dsc_path = shutil.which("dsc")
 
+    dns_preflight(base_url)
     version = check_version(base_url)
     print(f"Docspell version: {version.get('version', 'unknown')}")
     print(f"dsc: {dsc_path or 'not found; using read-only HTTP API'}")

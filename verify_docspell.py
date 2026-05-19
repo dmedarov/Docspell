@@ -35,6 +35,7 @@ import getpass
 import json
 import os
 import re
+import socket
 import sys
 import time
 import urllib.error
@@ -177,9 +178,14 @@ def login(base_url: str, args: argparse.Namespace) -> str:
 
 
 def check_version(base_url: str) -> dict[str, Any]:
+    # /api/info/version is the standard endpoint. The /api/v1/info/version
+    # fallback is for unusual reverse-proxy mounts. Previously the second
+    # URL used api_url(..., "/api/info/version") which produced the bogus
+    # /api/v1/api/info/version path — fixed below.
+    base = base_url.rstrip("/")
     urls = [
-        f"{base_url.rstrip('/')}/api/info/version",
-        api_url(base_url, "/api/info/version"),
+        f"{base}/api/info/version",
+        f"{base}/api/v1/info/version",
     ]
     last_error: Exception | None = None
     for url in urls:
@@ -188,6 +194,26 @@ def check_version(base_url: str) -> dict[str, Any]:
         except Exception as exc:
             last_error = exc
     raise RuntimeError(f"Version check failed: {last_error}")
+
+
+def dns_preflight(base_url: str) -> None:
+    """Resolve the URL host before any HTTP traffic. Exits 2 on failure."""
+    try:
+        host = urllib.parse.urlsplit(base_url).hostname
+    except Exception:
+        host = None
+    if not host:
+        return
+    try:
+        socket.gethostbyname(host)
+    except OSError:
+        print(
+            f"DNS resolution failed for {host}.\n"
+            "If on Tailscale: check `tailscale status` or add to /etc/hosts:\n"
+            f"  100.66.18.7  {host}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
 
 
 # ---------------------------------------------------------------------------
@@ -529,10 +555,39 @@ def build_report(
     total_items = len(all_items)
 
     # 8. Items with book_year
-    items_with_book_year = search_items(
-        base_url, token, "customfield.book_year>0", limit=500, max_items=5000
-    )
-    sources.append("GET /sec/item/search?q=customfield.book_year>0")
+    # Docspell 0.43.0 query language for custom fields:
+    #   `f.book_year>0`           → ParseFailure (expects `:` after name)
+    #   `customfield.book_year>0` → ParseFailure (unknown prefix)
+    #   `exist:f.book_year`       → ParseFailure (exist: only for relationships)
+    #   `f.book_year:>0`          → works (colon + operator + value)
+    # If even this fails, fall back to the apply-enrichment-log.csv count.
+    n_with_book_year = 0
+    try:
+        items_with_book_year = search_items(
+            base_url, token, "f.book_year:>0", limit=500, max_items=5000
+        )
+        n_with_book_year = len(items_with_book_year)
+        sources.append("GET /sec/item/search?q=f.book_year:>0")
+    except Exception as exc:
+        # Fall back: count items with book_year from the apply-enrichment log.
+        try:
+            log_path = HERE / "out" / "apply-enrichment-log.csv"
+            if log_path.exists():
+                with log_path.open("r", encoding="utf-8", newline="") as fh:
+                    import csv as _csv
+                    reader = _csv.DictReader(fh)
+                    n_with_book_year = sum(
+                        1 for r in reader if (r.get("year_set") or "").lower() == "set"
+                    )
+                sources.append("LOCAL: out/apply-enrichment-log.csv year_set=set count")
+            else:
+                anomalies.append(
+                    f"Could not count items with book_year (query failed: {redact(str(exc))[:80]})"
+                )
+        except Exception as fallback_exc:
+            anomalies.append(
+                f"Could not count items with book_year (both query and log failed: {redact(str(fallback_exc))[:80]})"
+            )
     n_with_book_year = len(items_with_book_year)
     if abs(n_with_book_year - EXPECTED_ITEMS_WITH_BOOK_YEAR) > 20:
         anomalies.append(
@@ -850,7 +905,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--brief",
         action="store_true",
-        help="Print only Summary + Verification sections to stdout (cron-friendly).",
+        help="Print only Summary + Verification sections to stdout (cron-friendly). "
+        "Full reports are still written to --report-md / --report-json unless --no-write is set.",
+    )
+    parser.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Do not write report files to disk; print results to stdout only.",
     )
     return parser.parse_args()
 
@@ -859,6 +920,7 @@ def main() -> int:
     args = parse_args()
     base_url = args.url.rstrip("/")
 
+    dns_preflight(base_url)
     version = check_version(base_url)
     print(f"Docspell URL:     {base_url}")
     print(f"Docspell version: {version.get('version', 'unknown')}")
@@ -879,21 +941,25 @@ def main() -> int:
         md_path = Path.cwd() / md_path
     if not json_path.is_absolute():
         json_path = Path.cwd() / json_path
-    md_path.parent.mkdir(parents=True, exist_ok=True)
-    json_path.parent.mkdir(parents=True, exist_ok=True)
 
-    md_path.write_text(render_markdown(report), encoding="utf-8")
-    json_path.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    if not args.no_write:
+        md_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        md_path.write_text(render_markdown(report), encoding="utf-8")
+        json_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
+    # --brief is additive: full reports are still written to disk (unless
+    # --no-write is set), but only the brief summary is printed to stdout.
     if args.brief:
         print(render_brief(report))
     else:
-        print(f"Report written:")
-        print(f"  {md_path}")
-        print(f"  {json_path}")
-        print()
+        if not args.no_write:
+            print(f"Report written:")
+            print(f"  {md_path}")
+            print(f"  {json_path}")
+            print()
         print(
             f"Anomalies: {len(report['anomalies'])} | "
             f"Verification fails: "

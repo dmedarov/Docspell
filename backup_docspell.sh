@@ -1,40 +1,47 @@
-#!/usr/bin/env bash
+#!/bin/bash
 #
-# backup_docspell.sh — nightly backup of a Dockerized Docspell instance.
+# backup_docspell.sh — nightly backup of a Docspell instance.
 #
-# Purpose
-#   Produce a timestamped, self-contained backup of:
-#     1. The Postgres database (pg_dump, gzip-compressed)
-#     2. The Docspell file storage volume (tar.gz)
-#   Plus a manifest with sizes, sha256 of the dump, and the running version.
+# Three modes (set DOCSPELL_BACKUP_MODE explicitly, or let auto-detect choose):
 #
-# Safety
-#   - Defaults to non-destructive: never deletes anything outside its own
-#     BACKUP_DIR rotation policy.
-#   - Reads credentials only via env vars; never echoes them.
-#   - The file storage tar runs against a live volume. That is fast but is
-#     NOT a fully consistent snapshot — large files in mid-write COULD be
-#     captured in a torn state. For a fully consistent point-in-time
-#     backup, stop the Docspell containers first (see commented block at
-#     the end of this script).
-#   - Exits non-zero on any failure (set -euo pipefail).
+#   dsc    Run `dsc export` entirely on the local Mac. No Docker required.
+#          Produces a user-portable archive (items + metadata) via the
+#          Docspell CLI. This is the recommended mode for Damian's setup
+#          (server is on a remote Proxmox VE host, only Tailscale-reachable).
+#
+#   ssh    Run docker/pg_dump on a remote host over SSH, then scp the dump
+#          back to ${BACKUP_DIR}. Volume tar is also produced remotely and
+#          fetched. Requires SSH access to ${DOCSPELL_SSH_HOST:-pve}.
+#
+#   local  Original behavior — Docker is on the same machine. Runs
+#          `docker exec ... pg_dump ...` against a local container and
+#          tars a local docker volume. Kept for users who self-host on
+#          the same box as this script.
+#
+# Auto-detect order when DOCSPELL_BACKUP_MODE is unset:
+#   1) dsc   (if `command -v dsc` succeeds)
+#   2) ssh   (if DOCSPELL_SSH_HOST is set OR `ssh -G pve` resolves a host)
+#   3) local (fallback)
+#
+# Rotation policy (per mode — separate subdirs under BACKUP_DIR):
+#   - Last 7 daily backups
+#   - Last 4 weekly backups (Sundays)
+#   - Last 12 monthly backups (1st of month)
 #
 # Usage
 #   ./backup_docspell.sh
+#   DOCSPELL_BACKUP_MODE=ssh DOCSPELL_SSH_HOST=pve ./backup_docspell.sh
+#   DOCSPELL_BACKUP_MODE=dsc ./backup_docspell.sh
 #
-# Sample crontab (run nightly at 03:00):
-#   0 3 * * * /Users/dmedarov/CODING/Docspell/backup_docspell.sh >> /Users/dmedarov/Backups/Docspell/cron.log 2>&1
-#
-# Rotation policy
-#   - Last 7 daily backups
-#   - Last 4 weekly backups (those taken on Sunday)
-#   - Last 12 monthly backups (those taken on the 1st of the month)
+# Sample crontab (nightly at 03:00):
+#   0 3 * * * /Users/dmedarov/CODING/Docspell/backup_docspell.sh \
+#       >> /Users/dmedarov/Backups/Docspell/cron.log 2>&1
 #
 
 set -euo pipefail
 
 # -----------------------------------------------------------------------------
-# Configuration — override via environment if defaults don't fit.
+# Configuration
 # -----------------------------------------------------------------------------
 
 : "${DOCSPELL_DB_CONTAINER:=docspell-db}"
@@ -43,6 +50,8 @@ set -euo pipefail
 : "${DOCSPELL_DATA_VOLUME:=docspell_data}"
 : "${BACKUP_DIR:=/Users/dmedarov/Backups/Docspell}"
 : "${DOCSPELL_URL:=https://docspell.medarov.net}"
+: "${DOCSPELL_SSH_HOST:=}"      # e.g. "pve" or "user@pve"
+: "${DOCSPELL_BACKUP_MODE:=}"   # one of: dsc, ssh, local
 
 : "${KEEP_DAILY:=7}"
 : "${KEEP_WEEKLY:=4}"
@@ -50,11 +59,6 @@ set -euo pipefail
 
 TIMESTAMP="$(date +%Y-%m-%dT%H-%M-%S)"
 DATE_ONLY="$(date +%Y-%m-%d)"
-DAY_OF_WEEK="$(date +%u)"     # 1 = Mon ... 7 = Sun
-DAY_OF_MONTH="$(date +%d)"
-
-DEST="${BACKUP_DIR}/${DATE_ONLY}_${TIMESTAMP}"
-LATEST_LINK="${BACKUP_DIR}/latest"
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -73,8 +77,7 @@ require() {
     command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
-# Strip credentials from any text we might log (defensive — we never expect
-# secrets on stdout, but if a tool ever leaks one we want it scrubbed).
+# Strip credentials from any text we might log defensively.
 redact() {
     sed -E \
         -e 's/(password=)[^[:space:]]+/\1<redacted>/Ig' \
@@ -83,16 +86,9 @@ redact() {
 }
 
 # -----------------------------------------------------------------------------
-# Preflight
+# Pick the sha256 tool that exists (macOS vs Linux).
 # -----------------------------------------------------------------------------
 
-require docker
-require gzip
-require tar
-require shasum || require sha256sum  # macOS uses shasum; Linux uses sha256sum
-require curl
-
-# Pick the sha256 tool that exists.
 if command -v sha256sum >/dev/null 2>&1; then
     SHA256_CMD="sha256sum"
 elif command -v shasum >/dev/null 2>&1; then
@@ -101,135 +97,306 @@ else
     die "no sha256 tool (sha256sum or shasum) available"
 fi
 
-mkdir -p "${BACKUP_DIR}"
-mkdir -p "${DEST}"
+# -----------------------------------------------------------------------------
+# Mode auto-detection
+# -----------------------------------------------------------------------------
+
+detect_mode() {
+    if [ -n "${DOCSPELL_BACKUP_MODE}" ]; then
+        printf '%s' "${DOCSPELL_BACKUP_MODE}"
+        return
+    fi
+    if command -v dsc >/dev/null 2>&1; then
+        printf '%s' "dsc"
+        return
+    fi
+    if [ -n "${DOCSPELL_SSH_HOST}" ] || ssh -G pve >/dev/null 2>&1; then
+        printf '%s' "ssh"
+        return
+    fi
+    printf '%s' "local"
+}
+
+MODE="$(detect_mode)"
+case "${MODE}" in
+    dsc|ssh|local) : ;;
+    *) die "unknown DOCSPELL_BACKUP_MODE='${MODE}' (expected: dsc, ssh, local)" ;;
+esac
+
+# Per-mode destination (separate rotation pools).
+MODE_DIR="${BACKUP_DIR}/${MODE}"
+DEST="${MODE_DIR}/${DATE_ONLY}_${TIMESTAMP}"
+LATEST_LINK="${MODE_DIR}/latest"
+
+mkdir -p "${MODE_DIR}" "${DEST}"
 
 log "Docspell backup starting"
+log "  Mode:           ${MODE}"
 log "  Destination:    ${DEST}"
-log "  DB container:   ${DOCSPELL_DB_CONTAINER}"
-log "  DB name/user:   ${DOCSPELL_DB_NAME} / ${DOCSPELL_DB_USER}"
-log "  Data volume:    ${DOCSPELL_DATA_VOLUME}"
-
-# Verify the DB container is up.
-if ! docker inspect "${DOCSPELL_DB_CONTAINER}" >/dev/null 2>&1; then
-    die "DB container '${DOCSPELL_DB_CONTAINER}' not found. Is Docspell running?"
-fi
+log "  Docspell URL:   ${DOCSPELL_URL}"
 
 # -----------------------------------------------------------------------------
-# 1. pg_dump → .sql.gz
+# Version probe (best-effort, used by all modes for the manifest)
 # -----------------------------------------------------------------------------
 
-DUMP_FILE="${DEST}/docspell-db_${TIMESTAMP}.sql.gz"
-log "Dumping Postgres → ${DUMP_FILE}"
+probe_version() {
+    if ! command -v curl >/dev/null 2>&1; then
+        printf '%s' "unknown"
+        return
+    fi
+    local json
+    json="$(curl -fsS --max-time 15 "${DOCSPELL_URL}/api/info/version" 2>/dev/null || echo '{}')"
+    local v
+    v="$(printf '%s' "${json}" \
+        | sed -nE 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p')"
+    printf '%s' "${v:-unknown}"
+}
 
-# Stream pg_dump out of the container straight into gzip on the host.
-# We use --no-owner / --no-privileges to make the dump portable across
-# instances; remove those flags if you want exact ACL preservation.
-if ! docker exec -i "${DOCSPELL_DB_CONTAINER}" \
-        pg_dump \
-            --username="${DOCSPELL_DB_USER}" \
-            --dbname="${DOCSPELL_DB_NAME}" \
-            --no-owner \
-            --no-privileges \
-            --format=plain \
-        2> >(redact >&2) \
-        | gzip -9 > "${DUMP_FILE}"; then
-    die "pg_dump failed"
-fi
-
-DUMP_SIZE="$(wc -c < "${DUMP_FILE}" | tr -d ' ')"
-log "  dump size: ${DUMP_SIZE} bytes"
-
-DUMP_SHA="$(${SHA256_CMD} "${DUMP_FILE}" | awk '{print $1}')"
-log "  dump sha256: ${DUMP_SHA}"
-
-# -----------------------------------------------------------------------------
-# 2. File storage volume → .tar.gz
-# -----------------------------------------------------------------------------
-
-DATA_ARCHIVE="${DEST}/docspell-data_${TIMESTAMP}.tar.gz"
-log "Archiving volume '${DOCSPELL_DATA_VOLUME}' → ${DATA_ARCHIVE}"
-log "  NOTE: live volume snapshot — see header for consistency caveat."
-
-# Mount the volume into an alpine container at /data and tar it out
-# directly to the host filesystem via a bind mount.
-if ! docker run --rm \
-        -v "${DOCSPELL_DATA_VOLUME}:/data:ro" \
-        -v "${DEST}:/backup" \
-        alpine:3 \
-        sh -c "cd /data && tar -czf /backup/$(basename "${DATA_ARCHIVE}") ."; then
-    die "volume archive failed"
-fi
-
-DATA_SIZE="$(wc -c < "${DATA_ARCHIVE}" | tr -d ' ')"
-log "  archive size: ${DATA_SIZE} bytes"
-
-# -----------------------------------------------------------------------------
-# 3. Version probe + manifest
-# -----------------------------------------------------------------------------
-
-VERSION_JSON="$(curl -fsS --max-time 15 "${DOCSPELL_URL}/api/info/version" 2>/dev/null || echo '{}')"
-DOCSPELL_VERSION="$(printf '%s' "${VERSION_JSON}" \
-    | sed -nE 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p')"
-DOCSPELL_VERSION="${DOCSPELL_VERSION:-unknown}"
+DOCSPELL_VERSION="$(probe_version)"
 log "  Docspell version: ${DOCSPELL_VERSION}"
 
-MANIFEST="${DEST}/manifest.txt"
-{
-    echo "docspell-backup-manifest v1"
-    echo "timestamp:         ${TIMESTAMP}"
-    echo "date:              ${DATE_ONLY}"
-    echo "docspell_url:      ${DOCSPELL_URL}"
-    echo "docspell_version:  ${DOCSPELL_VERSION}"
-    echo "db_container:      ${DOCSPELL_DB_CONTAINER}"
-    echo "db_user:           ${DOCSPELL_DB_USER}"
-    echo "db_name:           ${DOCSPELL_DB_NAME}"
-    echo "data_volume:       ${DOCSPELL_DATA_VOLUME}"
-    echo ""
-    echo "files:"
-    echo "  $(basename "${DUMP_FILE}")"
-    echo "    size:   ${DUMP_SIZE}"
-    echo "    sha256: ${DUMP_SHA}"
-    echo "  $(basename "${DATA_ARCHIVE}")"
-    echo "    size:   ${DATA_SIZE}"
-} > "${MANIFEST}"
+# -----------------------------------------------------------------------------
+# Mode: dsc — run the Docspell CLI entirely locally.
+# -----------------------------------------------------------------------------
 
-log "Manifest written: ${MANIFEST}"
+backup_dsc() {
+    require dsc
 
-# Update 'latest' symlink for convenience (best-effort).
+    local export_target="${DEST}/dsc-export"
+    mkdir -p "${export_target}"
+
+    log "Running dsc export → ${export_target}"
+    if ! dsc export --target "${export_target}" 2> >(redact >&2); then
+        die "dsc export failed"
+    fi
+
+    # Roll the exported tree into a single tar.gz for sane storage + checksum.
+    local archive="${DEST}/docspell-dsc_${TIMESTAMP}.tar.gz"
+    log "Compressing export → ${archive}"
+    tar -C "${DEST}" -czf "${archive}" "dsc-export"
+    rm -rf "${export_target}"
+
+    local size sha
+    size="$(wc -c < "${archive}" | tr -d ' ')"
+    sha="$(${SHA256_CMD} "${archive}" | awk '{print $1}')"
+    log "  archive size: ${size} bytes"
+    log "  archive sha256: ${sha}"
+
+    {
+        echo "docspell-backup-manifest v1"
+        echo "mode:              dsc"
+        echo "timestamp:         ${TIMESTAMP}"
+        echo "date:              ${DATE_ONLY}"
+        echo "docspell_url:      ${DOCSPELL_URL}"
+        echo "docspell_version:  ${DOCSPELL_VERSION}"
+        echo ""
+        echo "files:"
+        echo "  $(basename "${archive}")"
+        echo "    size:   ${size}"
+        echo "    sha256: ${sha}"
+    } > "${DEST}/manifest.txt"
+}
+
+# -----------------------------------------------------------------------------
+# Mode: ssh — run docker/pg_dump remotely, fetch via scp.
+# -----------------------------------------------------------------------------
+
+backup_ssh() {
+    require ssh
+    require scp
+    require gzip
+
+    local host="${DOCSPELL_SSH_HOST:-pve}"
+    log "  SSH host: ${host}"
+
+    # Verify SSH reachability and the DB container exists remotely.
+    if ! ssh -o BatchMode=yes -o ConnectTimeout=10 "${host}" "true" 2>/dev/null; then
+        die "ssh to '${host}' failed (BatchMode). Check Tailscale + key auth."
+    fi
+
+    if ! ssh "${host}" "docker inspect ${DOCSPELL_DB_CONTAINER}" >/dev/null 2>&1; then
+        die "DB container '${DOCSPELL_DB_CONTAINER}' not found on ${host}"
+    fi
+
+    local dump_file="${DEST}/docspell-db_${TIMESTAMP}.sql.gz"
+    log "Dumping Postgres on ${host} → ${dump_file}"
+
+    # Stream pg_dump from remote container directly to local gzip-compressed file.
+    if ! ssh "${host}" \
+            "docker exec -i ${DOCSPELL_DB_CONTAINER} \
+                pg_dump \
+                    --username=${DOCSPELL_DB_USER} \
+                    --dbname=${DOCSPELL_DB_NAME} \
+                    --no-owner \
+                    --no-privileges \
+                    --format=plain" \
+            2> >(redact >&2) \
+            | gzip -9 > "${dump_file}"; then
+        die "remote pg_dump failed"
+    fi
+
+    local dump_size dump_sha
+    dump_size="$(wc -c < "${dump_file}" | tr -d ' ')"
+    dump_sha="$(${SHA256_CMD} "${dump_file}" | awk '{print $1}')"
+    log "  dump size: ${dump_size} bytes"
+    log "  dump sha256: ${dump_sha}"
+
+    # Volume tar: produce on remote in /tmp, scp back, then delete remote copy.
+    local remote_archive="/tmp/docspell-data_${TIMESTAMP}.tar.gz"
+    local data_archive="${DEST}/docspell-data_${TIMESTAMP}.tar.gz"
+    log "Archiving remote volume '${DOCSPELL_DATA_VOLUME}' → ${data_archive}"
+
+    if ! ssh "${host}" \
+            "docker run --rm \
+                -v ${DOCSPELL_DATA_VOLUME}:/data:ro \
+                -v /tmp:/backup \
+                alpine:3 \
+                sh -c 'cd /data && tar -czf /backup/$(basename "${remote_archive}") .'"; then
+        die "remote volume archive failed"
+    fi
+
+    if ! scp -q "${host}:${remote_archive}" "${data_archive}"; then
+        die "scp of volume archive failed"
+    fi
+    ssh "${host}" "rm -f ${remote_archive}" || true
+
+    local data_size
+    data_size="$(wc -c < "${data_archive}" | tr -d ' ')"
+    log "  archive size: ${data_size} bytes"
+
+    {
+        echo "docspell-backup-manifest v1"
+        echo "mode:              ssh"
+        echo "ssh_host:          ${host}"
+        echo "timestamp:         ${TIMESTAMP}"
+        echo "date:              ${DATE_ONLY}"
+        echo "docspell_url:      ${DOCSPELL_URL}"
+        echo "docspell_version:  ${DOCSPELL_VERSION}"
+        echo "db_container:      ${DOCSPELL_DB_CONTAINER}"
+        echo "db_user:           ${DOCSPELL_DB_USER}"
+        echo "db_name:           ${DOCSPELL_DB_NAME}"
+        echo "data_volume:       ${DOCSPELL_DATA_VOLUME}"
+        echo ""
+        echo "files:"
+        echo "  $(basename "${dump_file}")"
+        echo "    size:   ${dump_size}"
+        echo "    sha256: ${dump_sha}"
+        echo "  $(basename "${data_archive}")"
+        echo "    size:   ${data_size}"
+    } > "${DEST}/manifest.txt"
+}
+
+# -----------------------------------------------------------------------------
+# Mode: local — original Docker-on-this-machine behavior.
+# -----------------------------------------------------------------------------
+
+backup_local() {
+    require docker
+    require gzip
+    require tar
+
+    if ! docker inspect "${DOCSPELL_DB_CONTAINER}" >/dev/null 2>&1; then
+        die "DB container '${DOCSPELL_DB_CONTAINER}' not found. Is Docspell running?"
+    fi
+
+    local dump_file="${DEST}/docspell-db_${TIMESTAMP}.sql.gz"
+    log "Dumping Postgres → ${dump_file}"
+    if ! docker exec -i "${DOCSPELL_DB_CONTAINER}" \
+            pg_dump \
+                --username="${DOCSPELL_DB_USER}" \
+                --dbname="${DOCSPELL_DB_NAME}" \
+                --no-owner \
+                --no-privileges \
+                --format=plain \
+            2> >(redact >&2) \
+            | gzip -9 > "${dump_file}"; then
+        die "pg_dump failed"
+    fi
+
+    local dump_size dump_sha
+    dump_size="$(wc -c < "${dump_file}" | tr -d ' ')"
+    dump_sha="$(${SHA256_CMD} "${dump_file}" | awk '{print $1}')"
+    log "  dump size: ${dump_size} bytes"
+    log "  dump sha256: ${dump_sha}"
+
+    local data_archive="${DEST}/docspell-data_${TIMESTAMP}.tar.gz"
+    log "Archiving volume '${DOCSPELL_DATA_VOLUME}' → ${data_archive}"
+    log "  NOTE: live volume snapshot — see header for consistency caveat."
+    if ! docker run --rm \
+            -v "${DOCSPELL_DATA_VOLUME}:/data:ro" \
+            -v "${DEST}:/backup" \
+            alpine:3 \
+            sh -c "cd /data && tar -czf /backup/$(basename "${data_archive}") ."; then
+        die "volume archive failed"
+    fi
+
+    local data_size
+    data_size="$(wc -c < "${data_archive}" | tr -d ' ')"
+    log "  archive size: ${data_size} bytes"
+
+    {
+        echo "docspell-backup-manifest v1"
+        echo "mode:              local"
+        echo "timestamp:         ${TIMESTAMP}"
+        echo "date:              ${DATE_ONLY}"
+        echo "docspell_url:      ${DOCSPELL_URL}"
+        echo "docspell_version:  ${DOCSPELL_VERSION}"
+        echo "db_container:      ${DOCSPELL_DB_CONTAINER}"
+        echo "db_user:           ${DOCSPELL_DB_USER}"
+        echo "db_name:           ${DOCSPELL_DB_NAME}"
+        echo "data_volume:       ${DOCSPELL_DATA_VOLUME}"
+        echo ""
+        echo "files:"
+        echo "  $(basename "${dump_file}")"
+        echo "    size:   ${dump_size}"
+        echo "    sha256: ${dump_sha}"
+        echo "  $(basename "${data_archive}")"
+        echo "    size:   ${data_size}"
+    } > "${DEST}/manifest.txt"
+}
+
+# -----------------------------------------------------------------------------
+# Run the chosen mode.
+# -----------------------------------------------------------------------------
+
+case "${MODE}" in
+    dsc)   backup_dsc   ;;
+    ssh)   backup_ssh   ;;
+    local) backup_local ;;
+esac
+
+log "Manifest written: ${DEST}/manifest.txt"
+
+# Update per-mode 'latest' symlink (best-effort).
 ln -snf "${DEST}" "${LATEST_LINK}" 2>/dev/null || true
 
 # -----------------------------------------------------------------------------
-# 4. Rotation
+# Rotation — per mode (each mode rotates within its own subdir).
 # -----------------------------------------------------------------------------
-#
-# Backup directories are named YYYY-MM-DD_*. We classify each by the
-# day-of-week / day-of-month encoded in its date and apply three
-# independent retention windows.
-#
 
 log "Applying rotation policy (daily=${KEEP_DAILY}, weekly=${KEEP_WEEKLY}, monthly=${KEEP_MONTHLY})"
 
-cd "${BACKUP_DIR}"
+cd "${MODE_DIR}"
 
 # Collect candidate backup dirs (newest first).
-mapfile -t ALL_BACKUPS < <(ls -1dt ./[0-9]*_*/ 2>/dev/null | sed 's:/$::' || true)
+ALL_BACKUPS=()
+while IFS= read -r line; do
+    ALL_BACKUPS+=("${line%/}")
+done < <(ls -1dt ./[0-9]*_*/ 2>/dev/null || true)
 
-declare -a KEEP=()
-
+KEEP=()
 count_daily=0
 count_weekly=0
 count_monthly=0
 
-for d in "${ALL_BACKUPS[@]}"; do
+for d in "${ALL_BACKUPS[@]:-}"; do
+    [ -z "${d}" ] && continue
     bn="$(basename "${d}")"
-    # Date is the leading YYYY-MM-DD portion.
     bdate="${bn%%_*}"
     if [[ ! "${bdate}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
         continue
     fi
 
-    # macOS `date -j` vs Linux `date -d` — try GNU first, fall back to BSD.
     if dow="$(date -d "${bdate}" +%u 2>/dev/null)"; then
         dom="$(date -d "${bdate}" +%d 2>/dev/null)"
     else
@@ -238,7 +405,6 @@ for d in "${ALL_BACKUPS[@]}"; do
     fi
 
     keep_this=0
-
     if (( count_daily < KEEP_DAILY )); then
         keep_this=1
         count_daily=$((count_daily + 1))
@@ -257,8 +423,8 @@ for d in "${ALL_BACKUPS[@]}"; do
     fi
 done
 
-# Delete anything not in KEEP.
-for d in "${ALL_BACKUPS[@]}"; do
+for d in "${ALL_BACKUPS[@]:-}"; do
+    [ -z "${d}" ] && continue
     bn="$(basename "${d}")"
     skip=0
     for k in "${KEEP[@]:-}"; do
@@ -269,22 +435,24 @@ for d in "${ALL_BACKUPS[@]}"; do
     done
     if (( skip == 0 )); then
         log "  rotating out: ${bn}"
-        rm -rf -- "${BACKUP_DIR}/${bn}"
+        rm -rf -- "${MODE_DIR}/${bn}"
     fi
 done
 
 log "Backup complete: ${DEST}"
 
 # -----------------------------------------------------------------------------
-# Optional: fully consistent snapshot (manual variant)
+# Optional: fully consistent snapshot (manual variant) — local/ssh modes only.
 # -----------------------------------------------------------------------------
 #
 # For a torn-write-free archive of the file storage volume, stop the
 # Docspell containers first. Example using docker compose:
 #
-#   docker compose -f /path/to/docspell/docker-compose.yml stop docspell-joex docspell-restserver
+#   docker compose -f /path/to/docspell/docker-compose.yml \
+#       stop docspell-joex docspell-restserver
 #   ./backup_docspell.sh
-#   docker compose -f /path/to/docspell/docker-compose.yml start docspell-restserver docspell-joex
+#   docker compose -f /path/to/docspell/docker-compose.yml \
+#       start docspell-restserver docspell-joex
 #
-# This adds ~30s–2min of downtime depending on instance size.
+# Over SSH, prefix with: ssh "${DOCSPELL_SSH_HOST:-pve}" '<command>'
 #

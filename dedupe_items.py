@@ -33,17 +33,22 @@ from __future__ import annotations
 
 import argparse
 import csv
-import getpass
-import json
 import os
-import re
 import sys
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from pathlib import Path
 from typing import Any
+
+from _docspell_common import (
+    Progress,
+    Session,
+    Summary,
+    dns_preflight,
+    err_to_log,
+    redact,
+    version_check,
+    version_warn,
+)
 
 
 DEFAULT_URL = "https://docspell.medarov.net"
@@ -53,119 +58,13 @@ CONFIRM_PHRASE = "DEDUPE-DELETE"
 
 
 # ---------------------------------------------------------------------------
-# HTTP plumbing
+# Item detail  (HTTP plumbing now lives in _docspell_common)
 # ---------------------------------------------------------------------------
 
 
-def api_url(base_url: str, path: str) -> str:
-    base = base_url.rstrip("/")
-    if base.endswith("/api/v1"):
-        return f"{base}{path}"
-    return f"{base}/api/v1{path}"
-
-
-def redact(text: str) -> str:
-    """Remove anything that smells like a credential before printing."""
-    text = re.sub(r'("token"\s*:\s*")[^"]+', r"\1<redacted>", text)
-    text = re.sub(r'("password"\s*:\s*")[^"]+', r"\1<redacted>", text)
-    text = re.sub(r"(X-Docspell-Auth:\s*)\S+", r"\1<redacted>", text, flags=re.I)
-    text = re.sub(r"(Cookie:\s*)[^\r\n]+", r"\1<redacted>", text, flags=re.I)
-    text = re.sub(r"(Authorization:\s*)\S+", r"\1<redacted>", text, flags=re.I)
-    return text
-
-
-def request_json(
-    method: str,
-    url: str,
-    *,
-    token: str | None = None,
-    body: dict[str, Any] | None = None,
-    timeout: int = 60,
-) -> Any:
-    headers = {"Accept": "application/json"}
-    data = None
-    if body is not None:
-        headers["Content-Type"] = "application/json"
-        data = json.dumps(body).encode("utf-8")
-    if token:
-        headers["X-Docspell-Auth"] = token
-
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+def get_item_detail(session: Session, item_id: str) -> dict[str, Any] | None:
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")
-        raise RuntimeError(
-            f"HTTP {exc.code} from {method} {url}: {redact(detail)}"
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Could not reach {url}: {exc.reason}") from exc
-
-    if not raw:
-        return {}
-    try:
-        return json.loads(raw.decode("utf-8"))
-    except json.JSONDecodeError:
-        return {}
-
-
-# ---------------------------------------------------------------------------
-# Auth
-# ---------------------------------------------------------------------------
-
-
-def prompt_credentials(args: argparse.Namespace) -> tuple[str, str]:
-    account = args.account or os.environ.get("DOCSPELL_ACCOUNT")
-    if not account:
-        account = input("Docspell account: ").strip()
-    password = os.environ.get("DOCSPELL_PASSWORD")
-    if password is None:
-        password = getpass.getpass("Docspell password: ")
-    return account, password
-
-
-def login(base_url: str, args: argparse.Namespace) -> str:
-    token = os.environ.get("DOCSPELL_TOKEN")
-    if token:
-        return token
-    account, password = prompt_credentials(args)
-    response = request_json(
-        "POST",
-        api_url(base_url, "/open/auth/login"),
-        body={"account": account, "password": password},
-    )
-    if not response.get("success"):
-        message = response.get("message", "login failed")
-        raise RuntimeError(f"Docspell login failed: {message}")
-    token = response.get("token")
-    if not token:
-        raise RuntimeError("Docspell login response did not contain an auth token.")
-    return token
-
-
-def check_version(base_url: str) -> dict[str, Any]:
-    urls = [
-        f"{base_url.rstrip('/')}/api/info/version",
-        api_url(base_url, "/api/info/version"),
-    ]
-    last_error: Exception | None = None
-    for url in urls:
-        try:
-            return request_json("GET", url, timeout=20)
-        except Exception as exc:
-            last_error = exc
-    raise RuntimeError(f"Version check failed: {last_error}")
-
-
-# ---------------------------------------------------------------------------
-# Item detail
-# ---------------------------------------------------------------------------
-
-
-def get_item_detail(base_url: str, token: str, item_id: str) -> dict[str, Any] | None:
-    try:
-        return request_json("GET", api_url(base_url, f"/sec/item/{item_id}"), token=token)
+        return session.request("GET", f"/sec/item/{item_id}")
     except RuntimeError:
         return None
 
@@ -241,12 +140,8 @@ def find_duplicate_groups(rows: list[dict[str, str]]) -> dict[str, list[str]]:
 # ---------------------------------------------------------------------------
 
 
-def delete_item(base_url: str, token: str, item_id: str) -> None:
-    request_json(
-        "DELETE",
-        api_url(base_url, f"/sec/item/{item_id}"),
-        token=token,
-    )
+def delete_item(session: Session, item_id: str) -> None:
+    session.request("DELETE", f"/sec/item/{item_id}")
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +178,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="(USE WITH CARE) skip the interactive second confirmation prompt",
     )
+    parser.add_argument(
+        "--limit", type=int, default=0,
+        help="Maximum number of duplicate ITEMS to delete (0 = all)",
+    )
+    parser.add_argument(
+        "--start-from", default="",
+        help="Skip duplicates until (and excluding) this item_id is reached. "
+             "Useful for resuming after a manual interruption.",
+    )
     return parser.parse_args()
 
 
@@ -311,6 +215,8 @@ def main() -> int:
     dry_run = not args.apply
     base_url = args.url.rstrip("/")
 
+    dns_preflight(base_url)
+
     try:
         csv_path = resolve_csv(args.csv)
     except FileNotFoundError:
@@ -320,9 +226,11 @@ def main() -> int:
     items = load_items(csv_path)
     duplicate_groups = find_duplicate_groups(items)
 
-    version = check_version(base_url)
+    version = version_check(base_url)
+    version_str = version.get("version", "unknown")
     print(f"Docspell URL:      {base_url}")
-    print(f"Docspell version:  {version.get('version', 'unknown')}")
+    print(f"Docspell version:  {version_str}")
+    version_warn(version_str)
     print(f"Mode:              {'APPLY (DELETE)' if not dry_run else 'dry-run'}")
     print(f"CSV:               {csv_path}")
     print(f"Total items in CSV:{len(items)}")
@@ -334,14 +242,14 @@ def main() -> int:
         return 0
 
     # We always need to authenticate to fetch dates/attachments for ranking.
-    token = login(base_url, args)
+    session = Session.from_args(base_url, args)
 
     # Build the per-group plan with API-fetched metadata.
     plan_rows: list[dict[str, Any]] = []
     for title, item_ids in sorted(duplicate_groups.items(), key=lambda kv: kv[0].casefold()):
         members: list[dict[str, Any]] = []
         for iid in item_ids:
-            detail = get_item_detail(base_url, token, iid)
+            detail = get_item_detail(session, iid)
             members.append(
                 {
                     "item_id": iid,
@@ -430,21 +338,57 @@ def main() -> int:
             print("Confirmation phrase did not match. Aborting.", file=sys.stderr)
             return 2
 
-    # Apply
-    ok = 0
-    failed = 0
-    for title, item_id in to_delete:
-        try:
-            delete_item(base_url, token, item_id)
-            print(f"  [del]  {item_id[:12]}…  {title}")
-            ok += 1
-        except Exception as exc:
-            print(f"  [FAIL] {item_id[:12]}…  {title}: {redact(str(exc))}")
-            failed += 1
+    # Honor --start-from and --limit on the delete list (NOT on the plan CSV).
+    if args.start_from:
+        idx = next(
+            (i for i, (_t, iid) in enumerate(to_delete) if iid == args.start_from),
+            None,
+        )
+        if idx is None:
+            print(
+                f"--start-from {args.start_from[:12]}… not found in delete list; "
+                f"proceeding from top.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"--start-from: resuming after index {idx}")
+            to_delete = to_delete[idx + 1 :]
+    if args.limit and args.limit > 0:
+        to_delete = to_delete[: args.limit]
 
-    print()
-    print(f"Delete complete: ok={ok}, failed={failed}")
-    return 1 if failed else 0
+    # Apply
+    retried_ids: set[str] = set()
+
+    def _on_net(msg: str) -> None:
+        if "retry" in msg or "401" in msg:
+            cur = getattr(_on_net, "current", None)
+            if cur:
+                retried_ids.add(cur)
+        sys.stdout.write("\n" + redact(msg) + "\n")
+        sys.stdout.flush()
+
+    session.log = _on_net
+
+    summary = Summary(log_path=str(plan_path))
+    progress = Progress(len(to_delete), prefix="  ", print_every=5)
+    for title, item_id in to_delete:
+        _on_net.current = item_id  # type: ignore[attr-defined]
+        try:
+            delete_item(session, item_id)
+            print(f"  [del]  {item_id[:12]}…  {title}")
+            summary.ok += 1
+            progress.tick(ok=True)
+        except Exception as exc:
+            print(f"  [FAIL] {item_id[:12]}…  {title}: {err_to_log(exc, max_body=80)}")
+            summary.failed += 1
+            progress.tick(failed=True)
+
+    progress.done()
+    summary.total = progress.processed
+    summary.retried = len(retried_ids)
+    summary.elapsed = progress.elapsed
+    summary.print()
+    return 1 if summary.failed else 0
 
 
 if __name__ == "__main__":

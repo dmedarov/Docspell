@@ -33,17 +33,23 @@ from __future__ import annotations
 
 import argparse
 import csv
-import getpass
-import json
 import os
-import re
 import sys
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from pathlib import Path
 from typing import Any
+
+from _docspell_common import (
+    Progress,
+    Session,
+    Summary,
+    dns_preflight,
+    err_to_log,
+    load_processed_ids,
+    redact,
+    version_check,
+    version_warn,
+)
 
 
 DEFAULT_URL = "https://docspell.medarov.net"
@@ -54,7 +60,7 @@ CONFIRM_PHRASE = "APPLY-ENRICHMENT"
 
 # Custom field definitions to ensure.
 # Docspell field types: text, numeric, money, bool, date
-CUSTOM_FIELDS = [
+CUSTOM_FIELDS: list[dict[str, str]] = [
     {"name": "book_year",      "label": "Year",      "ftype": "numeric"},
     {"name": "book_isbn",      "label": "ISBN",      "ftype": "text"},
     {"name": "book_publisher", "label": "Publisher", "ftype": "text"},
@@ -64,82 +70,12 @@ CUSTOM_FIELDS = [
 
 
 # ---------------------------------------------------------------------------
-# HTTP plumbing (same shape as apply_reviewed_actions.py)
-# ---------------------------------------------------------------------------
-
-
-def api_url(base: str, path: str) -> str:
-    base = base.rstrip("/")
-    if base.endswith("/api/v1"):
-        return f"{base}{path}"
-    return f"{base}/api/v1{path}"
-
-
-def redact(text: str) -> str:
-    text = re.sub(r'("token"\s*:\s*")[^"]+', r"\1<redacted>", text)
-    text = re.sub(r'("password"\s*:\s*")[^"]+', r"\1<redacted>", text)
-    text = re.sub(r"(X-Docspell-Auth:\s*)\S+", r"\1<redacted>", text, flags=re.I)
-    return text
-
-
-def request_json(method, url, *, token=None, body=None, timeout=30):
-    headers = {"Accept": "application/json"}
-    data = None
-    if body is not None:
-        headers["Content-Type"] = "application/json"
-        data = json.dumps(body).encode("utf-8")
-    if token:
-        headers["X-Docspell-Auth"] = token
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")
-        raise RuntimeError(f"HTTP {exc.code} from {method} {url}: {redact(detail)}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Could not reach {url}: {exc.reason}") from exc
-    if not raw:
-        return {}
-    try:
-        return json.loads(raw.decode("utf-8"))
-    except json.JSONDecodeError:
-        return {}
-
-
-def login(base_url, args):
-    token = os.environ.get("DOCSPELL_TOKEN")
-    if token:
-        return token
-    account = args.account or os.environ.get("DOCSPELL_ACCOUNT")
-    if not account:
-        account = input("Docspell account: ").strip()
-    password = os.environ.get("DOCSPELL_PASSWORD")
-    if password is None:
-        password = getpass.getpass("Docspell password: ")
-    resp = request_json("POST", api_url(base_url, "/open/auth/login"),
-                        body={"account": account, "password": password})
-    if not resp.get("success"):
-        raise RuntimeError("Docspell login failed: " + resp.get("message", ""))
-    return resp["token"]
-
-
-def check_version(base_url):
-    for u in (f"{base_url.rstrip('/')}/api/info/version", api_url(base_url, "/api/info/version")):
-        try:
-            return request_json("GET", u, timeout=15)
-        except Exception:
-            continue
-    raise RuntimeError("Could not get Docspell version")
-
-
-# ---------------------------------------------------------------------------
 # Custom field management
 # ---------------------------------------------------------------------------
 
 
-def list_custom_fields(base_url, token):
-    data = request_json("GET", api_url(base_url, "/sec/customfield") + "?query=", token=token)
+def list_custom_fields(session: Session) -> list[dict[str, Any]]:
+    data = session.request("GET", "/sec/customfield?query=")
     if isinstance(data, dict):
         return data.get("items", []) or []
     if isinstance(data, list):
@@ -147,7 +83,7 @@ def list_custom_fields(base_url, token):
     return []
 
 
-def _id_from_create_result(data):
+def _id_from_create_result(data: Any) -> str | None:
     if not isinstance(data, dict):
         return None
     for k in ("id", "newId", "value"):
@@ -157,18 +93,26 @@ def _id_from_create_result(data):
     return None
 
 
-def ensure_custom_field(base_url, token, name, label, ftype, *, dry_run, existing_by_name):
+def ensure_custom_field(
+    session: Session,
+    name: str,
+    label: str,
+    ftype: str,
+    *,
+    dry_run: bool,
+    existing_by_name: dict[str, dict[str, Any]],
+) -> tuple[str | None, str]:
     """Return (field_id, action) where action is 'reused' | 'created' | 'would-create'."""
     if name.lower() in existing_by_name:
         return existing_by_name[name.lower()]["id"], "reused"
     if dry_run:
         return None, "would-create"
     body = {"id": "", "name": name, "label": label, "ftype": ftype, "created": 0}
-    resp = request_json("POST", api_url(base_url, "/sec/customfield"), token=token, body=body)
+    resp = session.request("POST", "/sec/customfield", body=body)
     fid = _id_from_create_result(resp)
     if not fid:
         # Refresh and look up by name
-        for f in list_custom_fields(base_url, token):
+        for f in list_custom_fields(session):
             if str(f.get("name", "")).lower() == name.lower():
                 fid = f.get("id")
                 break
@@ -178,21 +122,22 @@ def ensure_custom_field(base_url, token, name, label, ftype, *, dry_run, existin
     return fid, "created"
 
 
-def set_item_custom_field(base_url, token, item_id, field_id_or_name, value):
+def set_item_custom_field(
+    session: Session, item_id: str, field_id_or_name: str, value: Any
+) -> None:
     """Set or update a custom field value on an item.
 
     Docspell endpoint: PUT /sec/item/{itemId}/customfield
     Body: {"field": <field-id-or-name>, "value": "<string>"}
     """
     body = {"field": field_id_or_name, "value": str(value)}
-    request_json("PUT", api_url(base_url, f"/sec/item/{item_id}/customfield"),
-                 token=token, body=body)
+    session.request("PUT", f"/sec/item/{item_id}/customfield", body=body)
 
 
-def get_item_field_values(base_url, token, item_id):
+def get_item_field_values(session: Session, item_id: str) -> dict[str, str]:
     """Return {field_name_or_id_lower: current_value_str} for an item."""
-    detail = request_json("GET", api_url(base_url, f"/sec/item/{item_id}"), token=token)
-    out = {}
+    detail = session.request("GET", f"/sec/item/{item_id}")
+    out: dict[str, str] = {}
     for cf in detail.get("customfields", []) or []:
         name = (cf.get("name") or "").lower()
         if name:
@@ -258,6 +203,12 @@ def parse_args():
                    help="overwrite existing non-empty custom-field values")
     p.add_argument("--limit", type=int, default=0,
                    help="max items to process (0 = all)")
+    p.add_argument("--start-from", default="",
+                   help="Skip rows until (and excluding) this item_id is "
+                        "reached. Useful for resuming after a manual interrupt.")
+    p.add_argument("--resume", action="store_true",
+                   help="Skip items already marked 'set'/'already-set'/"
+                        "'skipped-existing' in an existing log at --log.")
     return p.parse_args()
 
 
@@ -273,13 +224,16 @@ def resolve_csv(path_str):
     raise FileNotFoundError(path_str)
 
 
-def main():
+def main() -> int:
     args = parse_args()
     if args.apply and args.confirm != CONFIRM_PHRASE:
         print(f"--apply requires --confirm {CONFIRM_PHRASE}.", file=sys.stderr)
         return 2
     dry_run = not args.apply
     base_url = args.url.rstrip("/")
+
+    # DNS preflight (shared helper — exits 2 on failure with Tailscale hint).
+    dns_preflight(base_url)
 
     try:
         csv_path = resolve_csv(args.csv)
@@ -291,9 +245,22 @@ def main():
     if args.limit > 0:
         rows = rows[: args.limit]
 
-    version = check_version(base_url)
+    if args.start_from:
+        idx = next((i for i, r in enumerate(rows) if r["item_id"] == args.start_from), None)
+        if idx is None:
+            print(
+                f"--start-from {args.start_from[:12]}… not found; continuing from top.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"--start-from: resuming after index {idx}")
+            rows = rows[idx + 1 :]
+
+    version = version_check(base_url)
+    version_str = version.get("version", "unknown")
     print(f"Docspell URL:     {base_url}")
-    print(f"Docspell version: {version.get('version', 'unknown')}")
+    print(f"Docspell version: {version_str}")
+    version_warn(version_str)
     print(f"Mode:             {'APPLY' if not dry_run else 'dry-run'}")
     print(f"CSV:              {csv_path}")
     print(f"Min score:        {args.min_score}")
@@ -305,11 +272,11 @@ def main():
         print("Nothing to do.")
         return 0
 
-    token = login(base_url, args)
+    session = Session.from_args(base_url, args)
 
     # Resolve / create custom fields
-    existing = list_custom_fields(base_url, token)
-    existing_by_name = {}
+    existing = list_custom_fields(session)
+    existing_by_name: dict[str, dict[str, Any]] = {}
     for f in existing:
         nm = str(f.get("name", "")).lower()
         if nm:
@@ -320,10 +287,10 @@ def main():
                 "ftype": f.get("ftype"),
             }
 
-    field_ids = {}
+    field_ids: dict[str, str | None] = {}
     for spec in CUSTOM_FIELDS:
         fid, action = ensure_custom_field(
-            base_url, token, spec["name"], spec["label"], spec["ftype"],
+            session, spec["name"], spec["label"], spec["ftype"],
             dry_run=dry_run, existing_by_name=existing_by_name,
         )
         if action == "would-create":
@@ -353,30 +320,61 @@ def main():
         log_path = Path.cwd() / log_path
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
+    resumed: set[str] = set()
+    if args.resume:
+        resumed = load_processed_ids(
+            str(log_path),
+            item_id_field="item_id",
+            status_fields=("year_set", "isbn_set", "publisher_set", "author_set", "source_set"),
+        )
+        if resumed:
+            before = len(rows)
+            rows = [r for r in rows if r["item_id"] not in resumed]
+            print(f"--resume: skipping {before - len(rows)} item(s) "
+                  f"already completed in prior run ({log_path.name}).")
+
+    open_mode = "a" if (args.resume and log_path.exists()) else "w"
+    needs_header = open_mode == "w"
+
     print()
     print(f"Applying. Log: {log_path}")
-    ok = 0
-    failed = 0
-    with log_path.open("w", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=[
-            "timestamp", "item_id", "title", "score",
-            "year_set", "isbn_set", "publisher_set", "author_set", "source_set",
-            "error",
-        ])
-        w.writeheader()
-        for idx, r in enumerate(rows, start=1):
+    retried_ids: set[str] = set()
+
+    def _on_net(msg: str) -> None:
+        if "retry" in msg or "401" in msg:
+            cur = getattr(_on_net, "current", None)
+            if cur:
+                retried_ids.add(cur)
+        sys.stdout.write("\n" + redact(msg) + "\n")
+        sys.stdout.flush()
+
+    session.log = _on_net
+
+    summary = Summary(log_path=str(log_path))
+    progress = Progress(len(rows), prefix="  ")
+    fieldnames = [
+        "timestamp", "item_id", "title", "score",
+        "year_set", "isbn_set", "publisher_set", "author_set", "source_set",
+        "error",
+    ]
+    with log_path.open(open_mode, newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=fieldnames)
+        if needs_header:
+            w.writeheader()
+        for r in rows:
             item_id = r["item_id"]
+            _on_net.current = item_id  # type: ignore[attr-defined]
             title = r.get("original_title") or ""
             try:
                 # If --overwrite is off, read current values and skip non-empty fields
-                current = {}
+                current: dict[str, str] = {}
                 if not args.overwrite:
                     try:
-                        current = get_item_field_values(base_url, token, item_id)
+                        current = get_item_field_values(session, item_id)
                     except Exception:
                         current = {}
 
-                results = {}
+                results: dict[str, str] = {}
                 mapping = {
                     "book_year":      r.get("enrichment_year") or "",
                     "book_isbn":      r.get("enrichment_isbn13") or "",
@@ -396,7 +394,7 @@ def main():
                     if not args.overwrite and current.get(fname.lower()):
                         results[fname] = "skipped-existing"
                         continue
-                    set_item_custom_field(base_url, token, item_id, fname, val)
+                    set_item_custom_field(session, item_id, fname, val)
                     results[fname] = "set"
 
                 w.writerow({
@@ -411,9 +409,10 @@ def main():
                     "source_set": results.get("book_source", ""),
                     "error": "",
                 })
-                ok += 1
+                summary.ok += 1
+                progress.tick(ok=True)
             except Exception as exc:
-                err = redact(str(exc))
+                err = err_to_log(exc, max_body=80)
                 w.writerow({
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                     "item_id": item_id, "title": title,
@@ -422,14 +421,16 @@ def main():
                     "author_set": "", "source_set": "",
                     "error": err,
                 })
-                failed += 1
-            if idx % 25 == 0 or idx == len(rows):
-                print(f"  {idx}/{len(rows)} processed (ok={ok}, failed={failed})")
+                summary.failed += 1
+                progress.tick(failed=True)
 
-    print()
-    print(f"Apply complete: ok={ok}, failed={failed}")
-    print(f"Log: {log_path}")
-    return 0 if failed == 0 else 1
+    progress.done()
+    summary.total = progress.processed
+    summary.skipped = len(resumed)
+    summary.retried = len(retried_ids)
+    summary.elapsed = progress.elapsed
+    summary.print()
+    return 0 if summary.failed == 0 else 1
 
 
 if __name__ == "__main__":

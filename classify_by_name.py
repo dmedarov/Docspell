@@ -33,12 +33,13 @@ choose to encode the prefix as a Docspell category when creating tags.
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import re
 import sys
 import unicodedata
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -48,6 +49,11 @@ HERE = Path(__file__).resolve().parent
 SEARCHES_DIR = HERE / "out" / "docspell-searches"
 OUTPUT_CSV = HERE / "out" / "docspell-name-classification.csv"
 INBOX_QUERY = "inbox:yes"
+
+
+def redact(text: str) -> str:
+    """No-op for the offline classifier — preserved for API symmetry."""
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -482,9 +488,27 @@ def encoded_tags(c: Classification) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _classify_all(items: dict[str, Item]) -> list[tuple[Item, Classification, str, list[str], str]]:
+    """Classify every item; print progress every 100. Returns list of
+    (item, classification, folder, folder_reasoning, decision)."""
+    rows: list[tuple[Item, Classification, str, list[str], str]] = []
+    total = len(items)
+    for n, item in enumerate(
+        sorted(items.values(), key=lambda i: i.title.casefold()), start=1
+    ):
+        c = classify_title(item.title)
+        folder, folder_reasoning = assign_folder(c)
+        decision = decision_for(c, folder)
+        rows.append((item, c, folder, folder_reasoning, decision))
+        if n % 100 == 0 or n == total:
+            print(f"  classified {n}/{total}", file=sys.stderr)
+    return rows
+
+
 def write_csv(items: dict[str, Item], out_path: Path) -> dict[str, int]:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     counts: dict[str, int] = defaultdict(int)
+    classified = _classify_all(items)
     with out_path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(
             fh,
@@ -509,10 +533,7 @@ def write_csv(items: dict[str, Item], out_path: Path) -> dict[str, int]:
             ],
         )
         writer.writeheader()
-        for item in sorted(items.values(), key=lambda i: i.title.casefold()):
-            c = classify_title(item.title)
-            folder, folder_reasoning = assign_folder(c)
-            decision = decision_for(c, folder)
+        for item, c, folder, folder_reasoning, decision in classified:
             counts[decision] += 1
             counts[f"folder={folder or 'unset'}"] += 1
             tags = encoded_tags(c)
@@ -544,16 +565,80 @@ def write_csv(items: dict[str, Item], out_path: Path) -> dict[str, int]:
     return counts
 
 
+def print_stats(items: dict[str, Item]) -> dict[str, int]:
+    """Compute and print the distribution without writing the CSV."""
+    classified = _classify_all(items)
+    decisions: Counter[str] = Counter()
+    folders: Counter[str] = Counter()
+    doctypes: Counter[str] = Counter()
+    confidence_buckets: Counter[str] = Counter()
+    for _item, c, folder, _r, decision in classified:
+        decisions[decision] += 1
+        folders[folder or "(unset)"] += 1
+        doctypes[c.doctype or "(none)"] += 1
+        bucket = f"{int(c.confidence * 10) / 10:.1f}"
+        confidence_buckets[bucket] += 1
+
+    print()
+    print(f"Total items: {len(items)}")
+    print()
+    print("Decision distribution:")
+    for key in ("classified", "needs_review", "unclassified"):
+        print(f"  {key:14s}: {decisions.get(key, 0)}")
+    print()
+    print("Folder distribution:")
+    for folder, n in folders.most_common():
+        print(f"  {folder:14s}: {n}")
+    print()
+    print("Doctype distribution (top 15):")
+    for doctype, n in doctypes.most_common(15):
+        print(f"  {doctype:18s}: {n}")
+    print()
+    print("Confidence distribution:")
+    for bucket in sorted(confidence_buckets):
+        print(f"  {bucket:>4s}: {confidence_buckets[bucket]}")
+    return dict(decisions)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Offline name-based classifier for Docspell triage output. "
+        "Reads sanitized JSON from --input-dir and writes a classification CSV."
+    )
+    parser.add_argument(
+        "--input-dir",
+        default=str(SEARCHES_DIR),
+        help=f"Directory containing sanitized search JSON (default: {SEARCHES_DIR})",
+    )
+    parser.add_argument(
+        "--output",
+        default=str(OUTPUT_CSV),
+        help=f"Output CSV path (default: {OUTPUT_CSV})",
+    )
+    parser.add_argument(
+        "--stats",
+        action="store_true",
+        help="Print distribution of doctype/folder/confidence without writing the CSV.",
+    )
+    return parser.parse_args()
+
+
 def main() -> int:
-    if not SEARCHES_DIR.exists():
-        print(f"Searches dir not found: {SEARCHES_DIR}", file=sys.stderr)
+    args = parse_args()
+    searches_dir = Path(args.input_dir)
+    if not searches_dir.exists():
+        print(f"Searches dir not found: {searches_dir}", file=sys.stderr)
         return 1
-    items = load_items(SEARCHES_DIR)
-    print(f"Loaded {len(items)} unique items from {SEARCHES_DIR}")
+    items = load_items(searches_dir)
+    print(f"Loaded {len(items)} unique items from {searches_dir}")
 
-    counts = write_csv(items, OUTPUT_CSV)
+    if args.stats:
+        print_stats(items)
+        return 0
 
-    print(f"Wrote {OUTPUT_CSV}")
+    counts = write_csv(items, Path(args.output))
+
+    print(f"Wrote {args.output}")
     print()
     print("Decision distribution:")
     for key in ("classified", "needs_review", "unclassified"):
@@ -567,4 +652,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("\nCancelled.", file=sys.stderr)
+        raise SystemExit(130)
+    except Exception as exc:
+        print(f"Error: {redact(str(exc))}", file=sys.stderr)
+        raise SystemExit(1)

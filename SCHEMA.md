@@ -242,6 +242,15 @@ runs:
    the only recovery path.
 8. Tesseract base image ships `eng` + `deu` only; `bul` requires
    derived image or tessdata volume mount.
+9. **Query language for custom fields — empirically mapped in 0.43.0:**
+   - `customfield.book_year>0` → ParseFailure (unknown prefix)
+   - `f.book_year>0` → ParseFailure (expects `:` separator)
+   - `exist:f.book_year` → ParseFailure (`exist:` only works on
+     relationship fields like `conc.equip.id`, `corr.org.name`)
+   - **`f.book_year:>0`** → works (colon + operator + value)
+   - **`f.book_publisher:Oxford`** → works (exact match)
+   - **`f.book_publisher:~Oxford`** → works (case-insensitive substring)
+   - Range: `f.book_year:[1990;2000]`
 
 ## Schema versioning
 

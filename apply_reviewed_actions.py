@@ -32,17 +32,25 @@ from __future__ import annotations
 
 import argparse
 import csv
-import getpass
-import json
 import os
-import re
 import sys
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from pathlib import Path
 from typing import Any
+
+from _docspell_common import (
+    Progress,
+    Session,
+    Summary,
+    api_url,
+    dns_preflight,
+    err_to_log,
+    load_processed_ids,
+    redact,
+    version_check,
+    version_warn,
+)
 
 
 DEFAULT_URL = "https://docspell.medarov.net"
@@ -53,112 +61,6 @@ DEFAULT_FOLDER = "Archive"
 # or the newer name-based classifier vocabulary ("classified").
 DEFAULT_DECISIONS = ("classified", "safe_library_folder")
 CONFIRM_PHRASE = "APPLY-LIBRARY"
-
-
-# ---------------------------------------------------------------------------
-# HTTP plumbing (mirrors docspell_triage.py)
-# ---------------------------------------------------------------------------
-
-
-def api_url(base_url: str, path: str) -> str:
-    base = base_url.rstrip("/")
-    if base.endswith("/api/v1"):
-        return f"{base}{path}"
-    return f"{base}/api/v1{path}"
-
-
-def redact(text: str) -> str:
-    """Remove anything that smells like a credential before printing."""
-    text = re.sub(r'("token"\s*:\s*")[^"]+', r"\1<redacted>", text)
-    text = re.sub(r'("password"\s*:\s*")[^"]+', r"\1<redacted>", text)
-    text = re.sub(r"(X-Docspell-Auth:\s*)\S+", r"\1<redacted>", text, flags=re.I)
-    text = re.sub(r"(Cookie:\s*)[^\r\n]+", r"\1<redacted>", text, flags=re.I)
-    text = re.sub(r"(Authorization:\s*)\S+", r"\1<redacted>", text, flags=re.I)
-    return text
-
-
-def request_json(
-    method: str,
-    url: str,
-    *,
-    token: str | None = None,
-    body: dict[str, Any] | None = None,
-    timeout: int = 60,
-) -> Any:
-    headers = {"Accept": "application/json"}
-    data = None
-    if body is not None:
-        headers["Content-Type"] = "application/json"
-        data = json.dumps(body).encode("utf-8")
-    if token:
-        headers["X-Docspell-Auth"] = token
-
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")
-        raise RuntimeError(
-            f"HTTP {exc.code} from {method} {url}: {redact(detail)}"
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Could not reach {url}: {exc.reason}") from exc
-
-    if not raw:
-        return {}
-    try:
-        return json.loads(raw.decode("utf-8"))
-    except json.JSONDecodeError:
-        return {}
-
-
-# ---------------------------------------------------------------------------
-# Auth
-# ---------------------------------------------------------------------------
-
-
-def prompt_credentials(args: argparse.Namespace) -> tuple[str, str]:
-    account = args.account or os.environ.get("DOCSPELL_ACCOUNT")
-    if not account:
-        account = input("Docspell account: ").strip()
-    password = os.environ.get("DOCSPELL_PASSWORD")
-    if password is None:
-        password = getpass.getpass("Docspell password: ")
-    return account, password
-
-
-def login(base_url: str, args: argparse.Namespace) -> str:
-    token = os.environ.get("DOCSPELL_TOKEN")
-    if token:
-        return token
-    account, password = prompt_credentials(args)
-    response = request_json(
-        "POST",
-        api_url(base_url, "/open/auth/login"),
-        body={"account": account, "password": password},
-    )
-    if not response.get("success"):
-        message = response.get("message", "login failed")
-        raise RuntimeError(f"Docspell login failed: {message}")
-    token = response.get("token")
-    if not token:
-        raise RuntimeError("Docspell login response did not contain an auth token.")
-    return token
-
-
-def check_version(base_url: str) -> dict[str, Any]:
-    urls = [
-        f"{base_url.rstrip('/')}/api/info/version",
-        api_url(base_url, "/api/info/version"),
-    ]
-    last_error: Exception | None = None
-    for url in urls:
-        try:
-            return request_json("GET", url, timeout=20)
-        except Exception as exc:
-            last_error = exc
-    raise RuntimeError(f"Version check failed: {last_error}")
 
 
 # ---------------------------------------------------------------------------
@@ -276,14 +178,12 @@ def _extract_items(data: Any) -> list[dict[str, Any]]:
     return []
 
 
-def list_folders(base_url: str, token: str) -> list[dict[str, Any]]:
-    url = api_url(base_url, "/sec/folder") + "?query="
-    return _extract_items(request_json("GET", url, token=token))
+def list_folders(session: Session) -> list[dict[str, Any]]:
+    return _extract_items(session.request("GET", "/sec/folder?query="))
 
 
-def list_tags(base_url: str, token: str) -> list[dict[str, Any]]:
-    url = api_url(base_url, "/sec/tag") + "?q="
-    return _extract_items(request_json("GET", url, token=token))
+def list_tags(session: Session) -> list[dict[str, Any]]:
+    return _extract_items(session.request("GET", "/sec/tag?q="))
 
 
 def find_by_name(items: list[dict[str, Any]], name: str) -> dict[str, Any] | None:
@@ -305,24 +205,19 @@ def _id_from_create_result(data: Any) -> str | None:
 
 
 def ensure_folder(
-    base_url: str, token: str, name: str, *, dry_run: bool
+    session: Session, name: str, *, dry_run: bool
 ) -> tuple[str | None, bool]:
     """Return (folder_id, would_create_or_created). folder_id is None only in dry-run create path."""
-    folder = find_by_name(list_folders(base_url, token), name)
+    folder = find_by_name(list_folders(session), name)
     if folder:
         return folder.get("id"), False
     if dry_run:
         return None, True
-    result = request_json(
-        "POST",
-        api_url(base_url, "/sec/folder"),
-        token=token,
-        body={"name": name},
-    )
+    result = session.request("POST", "/sec/folder", body={"name": name})
     folder_id = _id_from_create_result(result)
     if not folder_id:
         # Fall back to re-listing.
-        folder = find_by_name(list_folders(base_url, token), name)
+        folder = find_by_name(list_folders(session), name)
         folder_id = folder.get("id") if folder else None
     if not folder_id:
         raise RuntimeError(f"Could not determine ID for folder '{name}' after create.")
@@ -335,8 +230,7 @@ def _tag_key(name: str, category: str | None) -> str:
 
 
 def ensure_tag(
-    base_url: str,
-    token: str,
+    session: Session,
     tag_index: dict[str, dict[str, Any]],
     name: str,
     category: str | None,
@@ -355,16 +249,17 @@ def ensure_tag(
             return fallback["id"], False
     if dry_run:
         return None, True
-    result = request_json(
+    # Docspell 0.43.0 requires id="" and created=0 on tag create — bare
+    # {name, category} returns HTTP 500.
+    result = session.request(
         "POST",
-        api_url(base_url, "/sec/tag"),
-        token=token,
-        body={"name": name, "category": category},
+        "/sec/tag",
+        body={"id": "", "name": name, "category": category, "created": 0},
     )
     tag_id = _id_from_create_result(result)
     if not tag_id:
         # Re-list and pick the matching tag.
-        for tag in list_tags(base_url, token):
+        for tag in list_tags(session):
             tname = str(tag.get("name", "")).strip()
             tcat = tag.get("category")
             if (
@@ -386,10 +281,10 @@ def ensure_tag(
 # ---------------------------------------------------------------------------
 
 
-def get_item_detail(base_url: str, token: str, item_id: str) -> dict[str, Any] | None:
+def get_item_detail(session: Session, item_id: str) -> dict[str, Any] | None:
     """Read-only fetch of current folder + tag names for an item."""
     try:
-        return request_json("GET", api_url(base_url, f"/sec/item/{item_id}"), token=token)
+        return session.request("GET", f"/sec/item/{item_id}")
     except RuntimeError:
         # Fall back to search by id, in case some deployments restrict /sec/item/{id}.
         params = urllib.parse.urlencode(
@@ -401,11 +296,7 @@ def get_item_detail(base_url: str, token: str, item_id: str) -> dict[str, Any] |
                 "searchMode": "normal",
             }
         )
-        data = request_json(
-            "GET",
-            f"{api_url(base_url, '/sec/item/search')}?{params}",
-            token=token,
-        )
+        data = session.request("GET", f"/sec/item/search?{params}")
         for group in (data.get("groups") or []):
             for item in (group.get("items") or []):
                 if isinstance(item, dict):
@@ -431,18 +322,11 @@ def current_state(detail: dict[str, Any] | None) -> tuple[str, set[str]]:
     return folder_name, tag_names
 
 
-def set_item_folder(base_url: str, token: str, item_id: str, folder_id: str) -> None:
-    request_json(
-        "PUT",
-        api_url(base_url, f"/sec/item/{item_id}/folder"),
-        token=token,
-        body={"id": folder_id},
-    )
+def set_item_folder(session: Session, item_id: str, folder_id: str) -> None:
+    session.request("PUT", f"/sec/item/{item_id}/folder", body={"id": folder_id})
 
 
-def add_item_tags(
-    base_url: str, token: str, item_id: str, tag_ids: list[str]
-) -> None:
+def add_item_tags(session: Session, item_id: str, tag_ids: list[str]) -> None:
     """Link tags to an item additively.
 
     Docspell 0.43.0 has a bug where POST /sec/item/{id}/tags returns 500.
@@ -452,12 +336,7 @@ def add_item_tags(
     """
     if not tag_ids:
         return
-    request_json(
-        "PUT",
-        api_url(base_url, f"/sec/item/{item_id}/taglink"),
-        token=token,
-        body={"items": tag_ids},
-    )
+    session.request("PUT", f"/sec/item/{item_id}/taglink", body={"items": tag_ids})
 
 
 # ---------------------------------------------------------------------------
@@ -499,6 +378,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Maximum items to process (0 = all)",
+    )
+    parser.add_argument(
+        "--start-from",
+        default="",
+        help="Skip rows until (and excluding) this item_id is reached. "
+        "Useful for resuming after a manual interruption.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip items already marked ok/set/already-set in an existing "
+        "log at --log (idempotent re-run). Default off.",
     )
     parser.add_argument(
         "--decision",
@@ -544,15 +435,39 @@ def main() -> int:
         print(f"CSV not found: {args.csv}", file=sys.stderr)
         return 1
 
+    # DNS preflight (clear error before any HTTP) — shared helper.
+    dns_preflight(base_url)
+
     accepted = set(args.decision) if args.decision else set(DEFAULT_DECISIONS)
     rows, skipped_manual, skipped_other, _columns = load_safe_rows(csv_path, accepted)
     if args.limit and args.limit > 0:
         rows = rows[: args.limit]
     plan, needed_tag_names = build_plan(rows, args.folder)
 
-    version = check_version(base_url)
+    # --start-from: drop everything up to and including the matched item_id.
+    if args.start_from:
+        idx_match = next(
+            (i for i, e in enumerate(plan) if e["item_id"] == args.start_from),
+            None,
+        )
+        if idx_match is None:
+            print(
+                f"--start-from {args.start_from[:12]}… not found in plan; "
+                f"continuing from the top.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"--start-from: resuming after index {idx_match} "
+                f"(item_id={args.start_from[:12]}…)"
+            )
+            plan = plan[idx_match + 1 :]
+
+    version = version_check(base_url)
+    version_str = version.get("version", "unknown")
     print(f"Docspell URL:     {base_url}")
-    print(f"Docspell version: {version.get('version', 'unknown')}")
+    print(f"Docspell version: {version_str}")
+    version_warn(version_str)
     print(f"Mode:             {'APPLY' if not dry_run else 'dry-run'}")
     print(f"CSV:              {csv_path}")
     print(f"Accepted reviews: {', '.join(sorted(accepted))}")
@@ -563,15 +478,13 @@ def main() -> int:
         print("Nothing to do.")
         return 0
 
-    token = login(base_url, args)
+    session = Session.from_args(base_url, args, log=lambda m: print(f"  [net] {m}"))
 
     # Resolve / create the target folder.
     target_folders = sorted({entry["target_folder"] for entry in plan})
     folder_ids: dict[str, str] = {}
     for folder_name in target_folders:
-        folder_id, mutated = ensure_folder(
-            base_url, token, folder_name, dry_run=dry_run
-        )
+        folder_id, mutated = ensure_folder(session, folder_name, dry_run=dry_run)
         if mutated and dry_run:
             print(f"[dry-run] Would create folder: {folder_name}")
         elif mutated:
@@ -582,7 +495,7 @@ def main() -> int:
             folder_ids[folder_name] = folder_id
 
     # Resolve / create tags. Tags are keyed by (name, category).
-    existing_tags = list_tags(base_url, token)
+    existing_tags = list_tags(session)
     tag_index: dict[str, dict[str, Any]] = {}
     for tag in existing_tags:
         name = str(tag.get("name", "")).strip()
@@ -617,9 +530,7 @@ def main() -> int:
             print(f"[dry-run] Would create tag: {label}")
     elif tags_to_create:
         for name, category in tags_to_create:
-            tag_id, _ = ensure_tag(
-                base_url, token, tag_index, name, category, dry_run=False
-            )
+            tag_id, _ = ensure_tag(session, tag_index, name, category, dry_run=False)
             if tag_id:
                 tag_id_by_key[_tag_key(name, category)] = tag_id
                 label = f"{category}:{name}" if category else name
@@ -659,28 +570,64 @@ def main() -> int:
         log_path = Path.cwd() / log_path
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # --resume: drop items already successfully processed in an existing log.
+    resumed_set: set[str] = set()
+    if args.resume:
+        resumed_set = load_processed_ids(
+            str(log_path),
+            item_id_field="item_id",
+            status_fields=("folder_status",),
+        )
+        if resumed_set:
+            before = len(plan)
+            plan = [e for e in plan if e["item_id"] not in resumed_set]
+            print(
+                f"--resume: skipping {before - len(plan)} item(s) already "
+                f"completed in prior run ({log_path.name})."
+            )
+
+    # In resume mode we append to the existing log; otherwise we start fresh.
+    open_mode = "a" if (args.resume and log_path.exists()) else "w"
+    needs_header = open_mode == "w"
+
     print()
     print(f"Applying changes. Log: {log_path}")
-    ok = 0
-    failed = 0
-    with log_path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(
-            fh,
-            fieldnames=[
-                "timestamp",
-                "item_id",
-                "title",
-                "target_folder",
-                "folder_status",
-                "tags_added",
-                "tags_skipped_existing",
-                "error",
-            ],
-        )
-        writer.writeheader()
+    fieldnames = [
+        "timestamp",
+        "item_id",
+        "title",
+        "target_folder",
+        "folder_status",
+        "tags_added",
+        "tags_skipped_existing",
+        "error",
+    ]
+    summary = Summary(log_path=str(log_path))
+    progress = Progress(len(plan), prefix="  ")
+    retried_ids: set[str] = set()
 
-        for index, entry in enumerate(plan, start=1):
+    def _on_net(msg: str) -> None:
+        # Each network log line implies a retry of some kind.
+        # We treat any "backoff … retry" event as a retry signal.
+        if "retry" in msg or "401" in msg:
+            # Attribute to the currently-processing item if known.
+            current = getattr(_on_net, "current", None)
+            if current:
+                retried_ids.add(current)
+        # Avoid scrambling the TTY progress line with the message.
+        sys.stdout.write("\n" + redact(msg) + "\n")
+        sys.stdout.flush()
+
+    session.log = _on_net
+
+    with log_path.open(open_mode, newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        if needs_header:
+            writer.writeheader()
+
+        for entry in plan:
             item_id = entry["item_id"]
+            _on_net.current = item_id  # type: ignore[attr-defined]
             title = entry["title"]
             target_folder = entry["target_folder"]
             folder_id = folder_ids.get(target_folder)
@@ -691,7 +638,7 @@ def main() -> int:
             error = ""
 
             try:
-                detail = get_item_detail(base_url, token, item_id)
+                detail = get_item_detail(session, item_id)
                 cur_folder, cur_tags = current_state(detail)
                 cur_tags_cf = {n.casefold() for n in cur_tags}
 
@@ -701,7 +648,7 @@ def main() -> int:
                 if cur_folder and cur_folder.casefold() == target_folder.casefold():
                     folder_status = "already-set"
                 else:
-                    set_item_folder(base_url, token, item_id, folder_id)
+                    set_item_folder(session, item_id, folder_id)
                     folder_status = "set"
 
                 # Tags — only add ones not already present on the item.
@@ -719,12 +666,14 @@ def main() -> int:
                     tag_ids_to_send.append(tid)
                     tags_added.append(label)
                 if tag_ids_to_send:
-                    add_item_tags(base_url, token, item_id, tag_ids_to_send)
+                    add_item_tags(session, item_id, tag_ids_to_send)
 
-                ok += 1
+                summary.ok += 1
+                progress.tick(ok=True)
             except Exception as exc:
-                error = redact(str(exc))
-                failed += 1
+                error = err_to_log(exc, max_body=80)
+                summary.failed += 1
+                progress.tick(failed=True)
 
             writer.writerow(
                 {
@@ -739,19 +688,19 @@ def main() -> int:
                 }
             )
 
-            if index % 25 == 0 or index == len(plan):
-                print(
-                    f"  {index}/{len(plan)} processed (ok={ok}, failed={failed})"
-                )
+    progress.done()
+    summary.total = progress.processed
+    summary.skipped = len(resumed_set)
+    summary.retried = len(retried_ids)
+    summary.elapsed = progress.elapsed
+    summary.print()
 
-    print()
-    print(f"Apply complete: ok={ok}, failed={failed}")
-    print(f"Log: {log_path}")
-    if failed:
+    if summary.failed:
         print(
-            "Some rows failed. Inspect the log; rerunning is safe — "
+            "\nSome rows failed. Inspect the log; rerunning is safe — "
             "items already in the target folder will be reported as 'already-set' "
-            "and existing tags will be skipped."
+            "and existing tags will be skipped. You can also pass --resume "
+            "to skip rows that already succeeded."
         )
         return 1
     return 0
