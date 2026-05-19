@@ -571,7 +571,7 @@ def build_report(
     except Exception as exc:
         # Fall back: count items with book_year from the apply-enrichment log.
         try:
-            log_path = HERE / "out" / "apply-enrichment-log.csv"
+            log_path = Path(__file__).resolve().parent / "out" / "apply-enrichment-log.csv"
             if log_path.exists():
                 with log_path.open("r", encoding="utf-8", newline="") as fh:
                     import csv as _csv
@@ -588,7 +588,7 @@ def build_report(
             anomalies.append(
                 f"Could not count items with book_year (both query and log failed: {redact(str(fallback_exc))[:80]})"
             )
-    n_with_book_year = len(items_with_book_year)
+    # n_with_book_year is set in either the try or the except branch above.
     if abs(n_with_book_year - EXPECTED_ITEMS_WITH_BOOK_YEAR) > 20:
         anomalies.append(
             f"{n_with_book_year} items have book_year, expected ~{EXPECTED_ITEMS_WITH_BOOK_YEAR}."
