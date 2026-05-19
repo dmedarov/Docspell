@@ -253,9 +253,25 @@ python3 setup_email_ingestion.py \
 
 ### Verify override is active
 ```bash
+# 1) Confirm the mounted file matches our repo version (md5)
+ssh root@pve 'pct exec 104 -- docker exec docspell-joex md5sum \
+  /opt/docspell-joex/conf/docspell-joex.conf'
+# Compare with: md5 -q ~/CODING/Docspell/conf/joex-override.conf
+
+# 2) Confirm JVM sees the config file
 ssh root@pve 'pct exec 104 -- docker exec docspell-joex bash -c \
-  "md5sum /opt/docspell-joex/conf/docspell-joex.conf && cat /proc/1/cmdline | tr \"\\0\" \"\\n\" | grep config.file"'
-# Expected: md5 of conf/joex-override.conf (in this repo) + -Dconfig.file=...
+  "ps -ef | grep java | grep -v grep"' | tr ' ' '\n' | grep config.file
+# Expected: -Dconfig.file=/opt/docspell-joex/bin/../conf/docspell-joex.conf
+
+# 3) Confirm joex is on PostgreSQL (not H2 fallback)
+ssh root@pve 'pct exec 104 -- docker logs --tail 100 docspell-joex 2>&1' \
+  | grep -i 'Database:' | tail -3
+# Expected: jdbc:postgresql://db:5432/dbname
+
+# 4) Count actual override args lines (excluding comments)
+ssh root@pve 'pct exec 104 -- docker exec docspell-joex bash -c \
+  "grep -v ^# /opt/docspell-joex/conf/docspell-joex.conf | grep -c bul+eng+rus"'
+# Expected: 3
 ```
 
 ### Re-deploy override (after editing conf/joex-override.conf)
@@ -444,11 +460,14 @@ ssh root@pve 'pct exec 104 -- docker logs --tail 30 docspell-joex 2>&1 | grep -i
 ### OCR returns garbled Bulgarian (mojibake like ÎÂÌËÂ)
 Override config is NOT loaded.
 ```bash
-# verify
-ssh root@pve 'pct exec 104 -- docker exec docspell-joex grep -c bul+eng+rus \
-  /opt/docspell-joex/conf/docspell-joex.conf'
-# Expected: 3 (one per command override)
-# If 0 → mount missing — see §5
+# verify — count non-comment args lines containing bul+eng+rus
+ssh root@pve 'pct exec 104 -- docker exec docspell-joex bash -c \
+  "grep -v ^# /opt/docspell-joex/conf/docspell-joex.conf | grep -c bul+eng+rus"'
+# Expected: 3 (one per command override: extraction.ocr, convert.tesseract, convert.ocrmypdf)
+#
+# Note: a plain `grep -c` (without the comment filter) returns 5 — that's
+# 3 actual config lines + 2 documentation comment lines in the conf file.
+# If you see 0 → mount missing or config not deployed; see §5.
 ```
 
 ### Email scan finds 0 mails but Gmail label has messages
