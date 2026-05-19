@@ -252,8 +252,58 @@ runs:
    - **`f.book_publisher:~Oxford`** → works (case-insensitive substring)
    - Range: `f.book_year:[1990;2000]`
 
+## Multi-language OCR (`bul+eng+rus`) — joex config override
+
+Docspell v0.43.0 does **not** include Bulgarian in `Language.scala`'s
+enum (supported: deu/eng/fra/ita/spa/hun/por/ces/khm/dan/fin/nor/swe/
+rus/ron/nld/lav/jpn/heb/lit/pol/est/ukr/svk). However the joex
+container's bundled Tesseract 5.5.0 ships with 161 languages
+including `bul`, `rus`, and the `Cyrillic` group.
+
+Workaround: mount a HOCON config file at
+`/opt/docspell-joex/conf/docspell-joex.conf` (file is `conf/joex-override.conf`
+in this repo, pushed to pve at `/root/docspell-docker/docker-compose/conf/`).
+The file hardcodes `-l bul+eng+rus` in three places where Docspell
+substitutes `{{lang}}`:
+
+1. `extraction.ocr.tesseract.command.args` — text extraction
+2. `convert.tesseract.command.args` — image→PDF
+3. `convert.ocrmypdf.command.args` — PDF→PDF/A with text layer
+
+**Critical gotcha discovered the hard way**: when `config.file`
+system property points to an existing file, Docspell's
+`ConfigFactory.default` switches from `EnvConfig` (custom env-var→
+HOCON mapping with `_/__/___` underscore conventions) to Typesafe
+Config's `ConfigSource.default`. The latter does NOT auto-apply
+docker-compose env vars like `DOCSPELL_JOEX_JDBC_URL`. Result: joex
+silently falls back to bundled reference.conf defaults (H2
+in-memory DB) and stops processing jobs.
+
+Fix: the override config explicitly binds every docker-compose env
+var via Typesafe Config's native `${?ENV_VAR}` substitution syntax:
+
+```hocon
+docspell.joex {
+  jdbc.url = ${?DOCSPELL_JOEX_JDBC_URL}
+  jdbc.user = ${?DOCSPELL_JOEX_JDBC_USER}
+  jdbc.password = ${?DOCSPELL_JOEX_JDBC_PASSWORD}
+  full-text-search.solr.url = ${?DOCSPELL_JOEX_FULL__TEXT__SEARCH_SOLR_URL}
+  # ...all 13 env vars used in docker-compose joex section...
+
+  extraction.ocr.tesseract.command.args = ["{{file}}", "stdout", "-l", "bul+eng+rus"]
+  convert.tesseract.command.args = ["{{infile}}", "out", "-l", "bul+eng+rus", "pdf", "txt"]
+  convert.ocrmypdf.command.args = ["-l", "bul+eng+rus", "--skip-text", "--deskew", "-j", "1", "{{infile}}", "{{outfile}}"]
+}
+```
+
+Verification: joex log shows `Running external command: ocrmypdf -l
+bul+eng+rus ...`.
+
+Revert: remove the volume mount from docker-compose.yml's joex
+service and `docker compose up -d joex`.
+
 ## Schema versioning
 
 Bump the `schema_version` in `SCHEMA.md` when adding/removing
 folders, tag categories, custom fields, or making breaking changes to
-apply scripts. Current: **v1.0** (2026-05-19).
+apply scripts. Current: **v1.1** (2026-05-20) — added joex OCR override.
