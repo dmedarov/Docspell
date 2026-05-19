@@ -55,7 +55,11 @@ DEFAULT_APPLY_LOG = "out/apply-log.csv"
 # Expected values for the verification section. Keep in sync with
 # CLAUDE.md and the apply log; these are *targets*, not hard requirements.
 EXPECTED_FOLDER_COUNTS = {"Library": 654, "Personal": 2}
-EXPECTED_BOOK_TAG_COUNT = 22
+# 21 Book:* tags total (per SCHEMA.md):
+# Accounting, Banking, Car, DIY, Economics, Equipment, Government, HR,
+# History, Home, Learning, Legal Compliance, Management, Mathematics,
+# Monetary, Philosophy, Politics, Project Management, Property, Sports, Tax
+EXPECTED_BOOK_TAG_COUNT = 21
 EXPECTED_ORG_COUNT = 31
 EXPECTED_CUSTOM_FIELDS = [
     "book_year",
@@ -72,8 +76,10 @@ EXPECTED_PRESERVED_CATEGORYLESS_TAGS = [
     "Heating",
     "HOME",
     "user manual",
-    "Watering",
     "Certificate",
+    # Note: "Watering" is in category "Smart home" (not categoryless),
+    # so it's not checked here. The list above is the truly categoryless tags
+    # that the user had before our apply scripts ran.
 ]
 
 
@@ -427,9 +433,12 @@ def build_report(
             )
 
     # Same-name conflicts across categories (e.g. area:economics + Book:Economics).
+    # Use EXACT name (not case-folded) — Docspell tags are case-sensitive, so
+    # HOME (uppercase, no category) and Home (titlecase, Book category) are
+    # legitimately distinct tags, not duplicates.
     name_to_categories: dict[str, list[str]] = defaultdict(list)
     for t in tag_entries:
-        name_to_categories[t["name"].casefold()].append(t["category"] or "<none>")
+        name_to_categories[t["name"]].append(t["category"] or "<none>")
     for cf_name, cats in name_to_categories.items():
         if len(cats) > 1:
             anomalies.append(
