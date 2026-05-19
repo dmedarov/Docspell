@@ -302,6 +302,32 @@ bul+eng+rus ...`.
 Revert: remove the volume mount from docker-compose.yml's joex
 service and `docker compose up -d joex`.
 
+## Known broken: SMTP / "Send Item via E-Mail" in v0.43.0
+
+The Outgoing E-Mail feature (Send Item via E-Mail, configured in
+User Settings → E-Mail Settings → SMTP) is **broken on Docspell v0.43.0**
+due to upstream bug [eikek/docspell#3099](https://github.com/eikek/docspell/issues/3099)
+(open since 2025-07-05, confirmed by the maintainer).
+
+Symptom: POST `/sec/email/settings/smtp` returns
+`Internal error: ERROR: INSERT has more expressions than target columns`
+because Doobie generates 13 placeholders but the `useremail` table
+has 12 columns. The codec for `MailAddress` (used in `mail_from`)
+emits an extra value with no matching column.
+
+The maintainer-suggested manual INSERT workaround successfully writes
+the row to the DB, but then the read codec fails identically on GET
+(HTTP 500). Both directions broken.
+
+**Workaround used in practice**: skip the SMTP feature entirely.
+Outgoing email is done manually — download the PDF attachment from
+Docspell, compose a new mail in your Gmail web UI, attach the PDF.
+This is a small inconvenience compared to the value of incoming
+email ingestion (which works fine — see below).
+
+When eikek/docspell#3099 is fixed in a future release, upgrade and
+configure SMTP normally through the UI or `setup_email_ingestion.py`.
+
 ## Schema versioning
 
 Bump the `schema_version` in `SCHEMA.md` when adding/removing

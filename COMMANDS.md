@@ -488,6 +488,39 @@ Container TZ is misconfigured. See §6 "Change TZ".
 
 ---
 
+## Known broken in v0.43.0 — SMTP / "Send Item via E-Mail"
+
+**Bug**: POST `/sec/email/settings/smtp` returns
+`Internal error: ERROR: INSERT has more expressions than target columns`.
+Upstream issue [eikek/docspell#3099](https://github.com/eikek/docspell/issues/3099)
+(open since 2025-07-05, confirmed by maintainer).
+
+**Diagnostic** (if you forget and try again):
+```bash
+# This will fail; preserved here so you don't waste time debugging it again
+PW=$(security find-generic-password -s docspell -a library/dmedarov -w)
+TOKEN=$(curl -s -X POST -H 'Content-Type: application/json' \
+  -d "{\"account\":\"library/dmedarov\",\"password\":\"$PW\"}" \
+  https://docspell.medarov.net/api/v1/open/auth/login \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+unset PW
+
+curl -s -X POST -H "X-Docspell-Auth: $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"smtp-test","smtpHost":"smtp.gmail.com","smtpPort":587,"smtpUser":"x@y.z","smtpPassword":"p","from":"x@y.z","sslType":"starttls","ignoreCertificates":false}' \
+  https://docspell.medarov.net/api/v1/sec/email/settings/smtp
+# {"success":false,"message":"Internal error: ERROR: INSERT has more expressions than target columns ..."}
+```
+
+**Workaround**: skip the feature. To "send item via email":
+- Open the item in Docspell UI
+- Download the attachment(s) locally (toolbar → download)
+- Compose a new email in Gmail web/desktop, attach the file
+- Send manually
+
+**If upstream fix lands** (watch the issue): upgrade Docspell joex+restserver
+images to the version that includes the patch, then SMTP works via the
+normal UI/API. No code changes needed on our side.
+
 ## Quick reference: production state (as of 2026-05-20)
 
 - Docspell version: **0.43.0**
