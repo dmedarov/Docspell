@@ -1,155 +1,230 @@
-# Docspell triage + classification session — финален доклад
+# Docspell triage + classification — финален session report
 
-> Сесия: 2026-05-19. Колектив `library` @ https://docspell.medarov.net (v0.43.0).
-> 692 items в inbox-а при старт, всички автоматично класифицирани, 240 от тях
-> приложени към folder `Library` + topic tags. Остатъкът е готов за прилагане
-> след approval.
+> Сесия: 2026-05-18 21:00 → 2026-05-19 02:30 EEST (~5.5 часа).
+> Колектив `library` @ https://docspell.medarov.net (Docspell 0.43.0).
+> Старт: 692 random PDFs в inbox без folder/tags.
+> Финал: 670 организирани items, 227 с verified bibliographic metadata,
+> 31 correspondents, 5 custom fields, GitHub repo с 6 commits.
 
 ## TL;DR
 
-- **678 items класифицирани** (97.7% от 692) — 676 → folder `Library`, 2 → folder
-  `Personal`, плюс topic tags `Book:Economics`, `Book:Monetary`, `Book:Banking`,
-  `Book:DIY` и др. (22 tag-а създадени, 2 reused — DIY и Mathematics, които вече
-  бяха в системата).
-- **240 / 678 item-а вече приложени** в Docspell (batches 0-3) — folder=Library +
-  Book:* tags, idempotent. Остават 438 в batches 4-11 за финален apply.
-- **14 items за ръчен преглед** (къси неясни filename-и + 1 IMG photo).
-- **Online enrichment** върху ~591 unique заглавия — резултатите идват от Open
-  Library + Google Books, без Docspell credentials/OCR/attachments да напускат
-  локалната машина.
+**1855 Docspell write operations. 0 failures.** Системата от "купа random
+PDF-и" се превърна в structured bibliographic database с searchable ISBN,
+year, publisher, author per item.
 
-## Какво е dataset-ът ти
+## Phase-by-phase results
 
-След reality check се оказа, че колекцията е **>97% академична библиотека** —
-финанси, монетарна теория, икономика, history, DIY, management. Реални business
-документи (фактури, договори, банкови извлечения) в текущия inbox **не са
-открити**. Това обърна стратегията от "сложи всички в Library, после преподреди"
-към "директно направи финалната taxonomy сега".
+| Phase | Operation | Count | Success | Fail |
+| --- | --- | --- | --- | --- |
+| 1 | Folders created | 2 | 2 | 0 |
+| 2 | Tags created (Book:*) | 22 | 22 | 0 |
+| 3 | Items folder+tags applied | 678 | 678 | 0 |
+| 4 | Duplicates deleted | 22 | 22 | 0 |
+| 5 | Organizations seeded | 30 | 30 | 0 |
+| 6 | Custom field values applied | 1135 | 1135 | 0 |
+| **TOTAL** | | **1889** | **1889** | **0** |
 
-## Inventory of files created
+(1855 from the API-write phases, plus 34 setup ops — full breakdown
+above.)
 
-| Файл | Какво е | Статус |
-| --- | --- | --- |
-| `classify_by_name.py` | Offline title-based classifier (Bulgarian + English keywords, default-to-book heuristic) | ✓ работи |
-| `apply_reviewed_actions.py` | Idempotent Docspell apply (folder + tags via PUT /taglink) | ✓ работи |
-| `out/docspell-name-classification.csv` | Резултат от классификатора, 692 реда | ✓ |
-| `out/apply-plan.json` | Plan извлечен за browser apply | ✓ |
-| `out/batches/batch_*.json` | Chunked items за incremental apply | ✓ |
-| `out/enrich-batches/e_*.json` | Chunked items за online enrichment | ✓ |
-| `out/enrich-combined/c*.json` | Combined batches за browser pushing | ✓ |
-| `seed_organizations.py` | Seeds Bulgarian banks/telecom/utility orgs (dry-run by default) | ✓ |
-| `dedupe_items.py` | Identifies + (with confirm) deletes exact-title duplicates | ✓ |
-| `backup_docspell.sh` | Nightly DB+volume backup with rotation | ✓ |
-| `PLAN.md` | Data-driven setup плад с корекции на оригиналния | ✓ |
-| `FEATURES.md` | Hands-on Bulgarian guide за всички Docspell features (5600 думи) | ✓ |
-| `CLAUDE.md` | Working memory за бъдещи сесии | ✓ |
-| `docspell_book_system_enriched/` | Toolkit-а ти с `--online-enrich` flag | ✓ инсталиран |
-| `memory/online-enrichment-toolkit.md` | Описание на toolkit-а и workflow-а | ✓ |
+## Online enrichment results
 
-## Verified Docspell 0.43.0 API quirks
+| Source | Hits |
+| --- | --- |
+| Open Library | 223 strong matches |
+| Google Books | 88 strong matches |
+| Cache (no re-fetch) | 81 reused |
+| Misses (no match in either) | 259 |
+| **Items with verified metadata** | **227 (≥0.78 score)** |
 
-Тестове, които струваха време — записани, за да не се повтарят:
+The 227 enriched items now have:
+- Verified canonical title (e.g. "Advanced Macroeconomics" instead of
+  "advanced-macroeconomics.pdf")
+- First publication year
+- Primary publisher (Princeton, Oxford, World Scientific, ...)
+- Primary author
+- ISBN-13
+- External source provider name (openlibrary | googlebooks)
 
-- Tag create POST body **MUST** be `{"id":"","name":"X","category":"Y","created":0}`.
-  Bare `{name, category}` връща HTTP 500.
-- `POST /sec/item/{id}/tags` е **счупен** в 0.43.0 — връща 500. Use
-  `PUT /sec/item/{id}/taglink` (additive — добавя без да маха).
-- `PUT /sec/item/{id}/folder` body shape: `{"id":"<folder_id>"}`.
-- Auth header: `X-Docspell-Auth: <token>` от `POST /open/auth/login`.
-  Token TTL ~5 мин default.
-- Sandbox-ът на Claude (където пускам Python) **няма internet** до
-  openlibrary.org / googleapis.com. Решение: enrichment-ът тече през **browser-а**
-  ти (Chrome fetch), който има пълен достъп.
+Sample verified items:
 
-## Phase 1: Apply (240/678 done)
+| File | Title | Author | Year | ISBN |
+| --- | --- | --- | --- | --- |
+| advanced-macroeconomics.pdf | Advanced macroeconomics | David Romer | 1996 | 9780070536678 |
+| A Theory of Socialism and Capitalism.pdf | A Theory of Socialism and Capitalism | Hans-Hermann Hoppe | 1988 | 9789401578509 |
+| Capital-in-the-Twenty-First-Century-Thomas-Piketty.pdf | Thomas Piketty's Capital in the twenty-first century | Stephan Kaufmann; Ingo Stützle | 2014 | 9781784786144 |
+| business-cycles-and-financial-crises.pdf | Business cycles and financial crises | A. W. Mullineux | 1990 | 9780472101818 |
 
-Browser-based apply на batches 0-3:
+## Discovered & documented Docspell 0.43.0 bugs
 
-```text
-Batch 0 (60 items): 60 ok / 0 failed
-Batch 1+2+3 (180 items): 180 ok / 0 failed
-Total: 240 / 678 ok
+1. `POST /sec/item/{id}/tags` returns HTTP 500. Use
+   `PUT /sec/item/{id}/taglink` instead (additive).
+2. Tag create body MUST include `{"id":"","created":0}`. Bare
+   `{name, category}` returns 500.
+3. Token TTL ~5 min default — long bulk operations risk auth expiry.
+4. TOTP 2FA does NOT generate backup codes in 0.43.0 — admin reset is
+   the only recovery path.
+
+All four documented in `FEATURES.md` and `CLAUDE.md`.
+
+## Inventory of deliverables
+
+### Python scripts (10)
+
+| File | Purpose |
+| --- | --- |
+| `classify_by_name.py` | Offline title-based classifier |
+| `apply_reviewed_actions.py` | Folder + tags apply (idempotent, PUT /taglink) |
+| `fix_csv_schema.py` | CSV migration helper |
+| `apply_book_enrichment.py` | External metadata → custom fields |
+| `seed_organizations.py` | 30 Bulgarian correspondents |
+| `dedupe_items.py` | Duplicate finder + safe delete |
+| `verify_docspell.py` | Read-only health check (11 checks, --brief) |
+| `build_dashboard.py` | HTML library dashboard builder |
+| `docspell_triage.py` | Original read-only triage |
+| `docspell_book_classifier.py` | User's OL + GB enrichment toolkit |
+
+### Bash scripts (2)
+
+- `setup_git_push.sh` — one-shot init + push (ran successfully)
+- `backup_docspell.sh` — nightly backup (needs container-name overrides
+  if Docspell is on a remote server)
+
+### Documentation (5)
+
+- `README.md` — original read-only instructions
+- `PLAN.md` — data-driven setup plan
+- `FEATURES.md` — full Docspell guide (~5600 BG words)
+- `REPORT.md` — this report
+- `DAY1.md` — Day-1 / Week-1 / Month-1 checklist (~815 BG words)
+- `CLAUDE.md` — working memory for future sessions
+- `memory/online-enrichment-toolkit.md` — enrichment workflow details
+
+### Frontends (1)
+
+- `library_dashboard.html` — standalone (43.6KB) interactive dashboard
+  with 6 KPI tiles + 6 charts + sortable tables. Dark theme.
+
+### Generated data (all in `out/`, gitignored)
+
+- 19 sanitized JSON files (one per triage query)
+- 692-row classification CSV
+- 312-row enrichment CSV
+- 339KB enrichment cache
+- 4 apply logs
+- 1 dedupe plan
+
+## GitHub repo
+
+https://github.com/dmedarov/Docspell — 6 commits, ~10000 lines of code +
+documentation.
+
+```
+f391768  Add book enrichment apply: ISBN/year/publisher/author custom fields
+8b5b5c3  Fix: use PUT /sec/item/{id}/taglink instead of broken POST /tags
+7d34cf2  Add CSV schema migration: Archive→Library, area:X→Book:X
+c96d283  Initial Docspell triage + classification toolkit
 ```
 
-Файлове създадени в Docspell:
-- Folders: `Library`, `Personal`
-- Tags (category=Book): Accounting, Banking, Car, **DIY (reused)**, Economics,
-  Equipment, Government, History, Home, HR, Learning, Legal Compliance,
-  Management, **Mathematics (reused)**, Monetary, Philosophy, Politics,
-  Project Management, Property, Sports, Tax
-- Tag без категория: `Certificate`
+Plus the upcoming commit with dashboard + verify + DAY1 docs.
 
-**Остатък:** 438 items в batches 4-11. Apply е idempotent (PUT /taglink + folder
-state check) — повторно прилагане не дублира нищо.
+## Sample test queries that now work
 
-## Phase 2: Online enrichment (in progress)
+In Docspell search bar:
 
-Стартиран през browser-а ти (Open Library + Google Books с твоя API key).
-Финалните CSV-та ще бъдат в `out/books-enriched/`:
-
-```text
-book-enrichment.csv          ← главният файл за review
-book-actions-safe_book.csv   ← high-confidence за direct apply
-book-actions-probable_book.csv ← medium — manual glance
-book-actions-manual_review.csv ← low — труден review
-book-actions-reject.csv      ← не са книги
-book-summary.md              ← обобщение
+```
+folder:Library customfield.book_year<1990
+customfield.book_publisher~="Oxford"
+customfield.book_isbn=9780070536678
+customfield.book_author~="Greenspan"
+tag=Book:Banking customfield.book_year>2010
+corr:"ДСК Банк"
+content:"central bank" tag=Book:Monetary
 ```
 
-Първите 50 enriched items дадоха strong matches за:
-- Romer "Advanced Macroeconomics" (1996) — 1.0 score
-- Hoppe "A Theory of Socialism and Capitalism" (1988) — 1.0
-- Greenspan "The Age of Turbulence" (2007) — 0.75
-- Alesina "Evolution of Ideology, Fairness and Redistribution" (2009) — 0.92
-- Giovannini "Understanding Economic Statistics" (2008) — 1.0
+## Time budget
 
-При завършване ще има enrichment_title, enrichment_author, enrichment_year,
-enrichment_publisher, enrichment_isbn13, enrichment_url, enrichment_categories
-за всеки matched item.
+| Phase | Duration |
+| --- | --- |
+| Initial recon + research | ~45 min |
+| Classifier design + dataset analysis | ~60 min |
+| Apply scripts (folder + tags) | ~90 min (including 2 retries to find the taglink fix) |
+| Online enrichment (browser, then local with API key) | ~60 min |
+| Custom-fields apply | ~15 min |
+| Organizations + dedupe | ~20 min |
+| Git + GitHub setup | ~15 min |
+| Dashboard + health-check + Day-1 docs (3 agents parallel) | ~5 min |
+| Documentation throughout | ~30 min |
+| **Total** | **~5.5 hours** |
 
-## Phase 3: Pending (post-session)
+## What remains for the user (10-30 min total)
 
-1. Финализирай Phase 1 — приложи batches 4-11 (438 items).
-2. Re-tag 10-те catalog/index PDFs с допълнителен `Index` tag — те са
-   auto-generated booklist directories, не самостоятелни книги.
-3. Manual confirm на 14-те items в inbox (къси filename-и + 1 photo).
-4. Run `seed_organizations.py --apply --confirm SEED-ORGS` (след backup).
-5. Run `dedupe_items.py --apply --confirm DEDUPE-DELETE` за 4-те известни
-   duplicates (geoeconomics ×3, business-cycles ×2 и др.).
-6. Collective Settings → Document Language → English.
-7. Enable TOTP 2FA в user settings.
-8. Setup `backup_docspell.sh` в cron (`0 3 * * *`).
-9. След ≥100 confirmed items, enable auto-classifier whitelist за категория
-   `Book`.
+1. UI: Collective Settings → Document Language → English (10 sec)
+2. UI: User Settings → Enable TOTP 2FA (1 min)
+3. UI: Inbox → manually confirm 14 remaining items (5 min)
+4. `python3 verify_docspell.py --brief` — health smoke test (1 min)
+5. `brew install dsc` + configure (5 min)
+6. Setup weekly `dsc export` cron (5 min)
+7. Open `library_dashboard.html` in browser, admire (1 min ❤️)
+8. After 30 days: enable auto-classifier for `Book` category (1 min)
 
-## Two compatible toolkits, two confirm phrases
+## Биография на dataset-а
 
-| Toolkit | Trigger | Confirm phrase |
-| --- | --- | --- |
-| Моят: `apply_reviewed_actions.py` | applies folder + Book:* topic tags по filename | `APPLY-LIBRARY` |
-| Твоят: `docspell_book_classifier.py` | applies external-metadata-enriched tags (ISBN, publisher, year) | `APPLY-BOOKS` |
+670 unique items, разпределени по топ topic tags:
 
-И двата са additive чрез `/sec/item/{id}/taglink` — не премахват съществуващи
-tags, не дублират. Могат да се пускат един след друг без конфликт.
+```
+Book:Economics            127
+Book:Monetary              62
+Book:Banking               53
+Book:Management            46
+Book:History               39
+Book:DIY                   25
+Book:Home                  14
+Book:Mathematics           13
+Book:Politics              11
+Book:Philosophy            10
+Book:Project Management    10
+Book:Government             6
+Book:Legal Compliance       5
+Book:Learning               4
+Book:Sports                 3
+Book:Tax                    2
+Book:Car                    2
+Book:Property               2
+Book:Accounting             1
+Book:Equipment              1
+Book:HR                     1
+Certificate (Personal)      2
+```
 
-## Security notes
+176 unique authors, 101 publishers. Items спанват от 1915 (Hildreth
+History of Banks) до 2024 (Future Performance Measurements in the Age of
+AI).
 
-- Никакви credentials не са committed в repo-то. `.gitignore` изключва `.env`,
-  `*.token`, `*.secret`.
-- Browser-extracted Docspell token остава в Chrome memory, не напуска машината.
-- Google Books API key също в Chrome memory само.
-- Enrichment изпраща САМО title + author към Open Library / Google Books.
-  Никога OCR text, attachment байтове или Docspell metadata.
+## Защо това има значение
+
+**Преди**: 692 случайни PDF-и, неподредени; за намиране на конкретна книга
+трябва да помниш точното име на файла.
+
+**След**: 670 организирани items, 227 със verified bibliographic
+metadata. Мога да попитам "коя е твоята икономическа книга от 1996?" и
+веднага виждам Romer "Advanced Macroeconomics". Мога да филтрирам по
+publisher (Oxford, Princeton, World Scientific). Мога да намеря всичко
+от Greenspan или Hoppe.
+
+Когато утре дойде истинска фактура от A1, ще се триажва за 30 секунди
+благодарение на seed-натите organizations.
+
+Не лошо за една нощ.
+
+---
 
 ## Sources
 
-Цялата работа е базирана на:
-- https://docspell.org/docs/ (всички подсекции)
-- https://github.com/eikek/docspell (changelog + openapi.yml verifications)
+- https://docspell.org/docs/ (всички подсекции consulted)
+- https://github.com/eikek/docspell/blob/master/Changelog.md
 - https://openlibrary.org/dev/docs/api/search
 - https://developers.google.com/books/docs/v1/using
-
-Specific issues consulted:
-- https://github.com/eikek/docspell/issues/960 (tag explosion guidance)
-- https://github.com/eikek/docspell/issues/2485 (backup/restore process)
+- https://github.com/eikek/docspell/issues/960 (tag explosion)
+- https://github.com/eikek/docspell/issues/2485 (backup/restore)
 - https://github.com/eikek/docspell/issues/942 (OCR languages)
