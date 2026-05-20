@@ -949,10 +949,12 @@ class OnlineBookEnricher:
             return self.cache[key].get("result")
 
         candidates: list[dict[str, Any]] = []
-        if self.providers in ("both", "openlibrary"):
+        if self.providers in ("both", "all", "openlibrary"):
             candidates.extend(self.query_open_library(title, author))
-        if self.providers in ("both", "googlebooks"):
+        if self.providers in ("both", "all", "googlebooks"):
             candidates.extend(self.query_google_books(title, author))
+        if self.providers in ("all", "chitanka"):
+            candidates.extend(self.query_chitanka(title, author))
 
         best: Optional[dict[str, Any]] = None
         best_score = 0.0
@@ -1030,6 +1032,79 @@ class OnlineBookEnricher:
                 "url": url,
                 "cover_url": cover,
             })
+        return out
+
+    def query_chitanka(self, title: str, author: str = "") -> list[dict[str, Any]]:
+        """Query chitanka.info — Bulgarian books catalog (HTML scrape).
+
+        chitanka.info doesn't expose a public JSON API, but its search
+        page has a stable, well-marked-up structure:
+
+            <h2>Произведения</h2>
+            <dl class="text-entity" data-id="49548">
+              <a href="/text/49548-..." itemprop="name">Кратка история на България</a>
+              <dd class="tauthor"><a itemprop="name">Ричард Крамптън</a></dd>
+
+        We do a single search request and return the top N text-entity
+        matches with title + first author. Year/ISBN are not present in
+        the search page; we leave those empty.
+
+        Mostly useful for Bulgarian titles that OpenLibrary/GoogleBooks
+        don't index well.
+        """
+        import re as _re
+
+        self._throttle()
+        url = "https://chitanka.info/search?" + urllib.parse.urlencode({"q": title})
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "docspell-book-classifier/1.0 (+chitanka enrichment)",
+                "Accept": "text/html,application/xhtml+xml",
+            })
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                html = resp.read().decode("utf-8", errors="replace")
+        except Exception:
+            return []
+
+        out: list[dict[str, Any]] = []
+        # Extract each <dl class="text-entity" data-id="..."> block.
+        block_re = _re.compile(
+            r'<dl class="text-entity"[^>]*data-id="(?P<id>\d+)"[^>]*>(?P<body>.*?)</dl>',
+            _re.DOTALL,
+        )
+        title_re = _re.compile(
+            r'<a href="(?P<url>/text/[^"]+)"[^>]*itemprop="name"[^>]*>\s*<i>(?P<title>[^<]+)</i>',
+        )
+        author_re = _re.compile(
+            r'<dd class="tauthor"[^>]*>.*?itemprop="name">\s*(?P<author>[^<]+)\s*</a>',
+            _re.DOTALL,
+        )
+        for m in list(block_re.finditer(html))[: self.max_results]:
+            body = m.group("body")
+            title_m = title_re.search(body)
+            author_m = author_re.search(body)
+            book_title = (title_m.group("title").strip() if title_m else "").strip()
+            book_url = "https://chitanka.info" + title_m.group("url") if title_m else ""
+            authors = []
+            if author_m:
+                authors = [author_m.group("author").strip()]
+            if not book_title:
+                continue
+            out.append({
+                "source": "Chitanka",
+                "id": m.group("id"),
+                "title": normalize_text(book_title),
+                "authors": authors,
+                "year": "",       # not in search results
+                "publisher": "",
+                "isbns": [],
+                "isbn13": "",
+                "categories": [],
+                "url": book_url,
+                "cover_url": "",
+            })
+        if out:
+            self.stats["chitanka"] = self.stats.get("chitanka", 0) + 1
         return out
 
     def query_google_books(self, title: str, author: str = "") -> list[dict[str, Any]]:
@@ -1253,7 +1328,12 @@ def make_parser() -> argparse.ArgumentParser:
     common.add_argument("--rules", default="")
     common.add_argument("--seed-catalog", default="")
     common.add_argument("--online-enrich", action="store_true", help="Query Open Library / Google Books with title/author metadata only")
-    common.add_argument("--online-provider", choices=["both", "openlibrary", "googlebooks"], default="both", help="Which online metadata provider(s) to use")
+    common.add_argument("--online-provider",
+                        choices=["both", "all", "openlibrary", "googlebooks", "chitanka"],
+                        default="both",
+                        help="Which online metadata provider(s) to use. "
+                             "'both' = OL+GB (default), 'all' = OL+GB+chitanka, "
+                             "or one of: openlibrary / googlebooks / chitanka")
     common.add_argument("--online-cache", default="", help="Path to JSON cache. Default: <out>/book-enrichment-cache.json")
     common.add_argument("--online-max-results", type=int, default=5, help="Max provider results to score per title")
     common.add_argument("--online-delay", type=float, default=0.35, help="Delay between external API calls")
