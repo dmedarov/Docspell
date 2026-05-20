@@ -426,6 +426,60 @@ python3 setup_email_ingestion.py \
 
 ---
 
+## 8.5. Auto-tag classifier (Docspell native ML)
+
+Docspell trains an n-gram classifier from your existing labelled items
+and uses it to suggest tags + correspondent + persons + equipment for
+new items entering the system. Configured for this collective with:
+
+- categoryList: `["Book"]` (only Book:* tags are predicted)
+- listType: `whitelist`
+- itemCount: 300 (newest 300 items used as training data)
+- schedule: `*-*-* 03:30:00 UTC` (daily retrain at 03:30 UTC)
+
+### Trigger an immediate retrain
+```bash
+PW=$(security find-generic-password -s docspell -a library/dmedarov -w)
+TOKEN=$(curl -s -X POST -H 'Content-Type: application/json' \
+  -d "{\"account\":\"library/dmedarov\",\"password\":\"$PW\"}" \
+  https://docspell.medarov.net/api/v1/open/auth/login \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")
+unset PW
+curl -s -X POST -H "X-Docspell-Auth: $TOKEN" \
+  https://docspell.medarov.net/api/v1/sec/collective/classifier/startonce
+# {"success":true,"message":"Job submitted."}
+```
+
+### Watch training progress
+```bash
+curl -s -H "X-Docspell-Auth: $TOKEN" \
+  https://docspell.medarov.net/api/v1/sec/queue/state \
+  | python3 -m json.tool | grep -A 2 -i "Learn"
+```
+
+### Change config
+```bash
+curl -s -H "X-Docspell-Auth: $TOKEN" \
+  https://docspell.medarov.net/api/v1/sec/collective/settings > /tmp/cs.json
+
+# Edit /tmp/cs.json — adjust classifier block
+python3 -c "
+import json
+d = json.load(open('/tmp/cs.json'))
+d['classifier']['categoryList'] = ['Book', 'doctype']  # add doctype later
+d['classifier']['itemCount'] = 500
+print(json.dumps(d, indent=2))" > /tmp/cs-new.json
+
+curl -s -X POST -H "X-Docspell-Auth: $TOKEN" -H 'Content-Type: application/json' \
+  --data @/tmp/cs-new.json \
+  https://docspell.medarov.net/api/v1/sec/collective/settings
+```
+
+### Disable classifier
+Set `categoryList: []` — the daily job will skip training, no auto-tagging.
+
+---
+
 ## 9. Common troubleshooting
 
 ### "Authentication failed" mid-script
