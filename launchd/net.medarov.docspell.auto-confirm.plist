@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS LaunchAgent: runs auto_confirm.py twice a day to drain inbox.
+
+  Install:
+      cp launchd/net.medarov.docspell.auto-confirm.plist ~/Library/LaunchAgents/
+      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/net.medarov.docspell.auto-confirm.plist
+
+  Confirms items in state=created that already have folder + ≥1 tag.
+  Items without enough metadata stay in inbox for manual review.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>net.medarov.docspell.auto-confirm</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>DOCSPELL_PASSWORD=$(security find-generic-password -s docspell -a library/dmedarov -w) /opt/homebrew/bin/python3 /Users/dmedarov/CODING/Docspell/auto_confirm.py --apply --confirm AUTO-CONFIRM</string>
+  </array>
+
+  <key>StandardOutPath</key>
+  <string>/Users/dmedarov/Library/Logs/docspell-auto-confirm.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/dmedarov/Library/Logs/docspell-auto-confirm.log</string>
+
+  <key>StartCalendarInterval</key>
+  <array>
+    <!-- 10:00 -->
+    <dict>
+      <key>Hour</key>
+      <integer>10</integer>
+      <key>Minute</key>
+      <integer>0</integer>
+    </dict>
+    <!-- 22:00 -->
+    <dict>
+      <key>Hour</key>
+      <integer>22</integer>
+      <key>Minute</key>
+      <integer>0</integer>
+    </dict>
+  </array>
+
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>

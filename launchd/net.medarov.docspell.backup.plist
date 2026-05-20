@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS LaunchAgent: weekly Docspell backup via dsc export.
+
+  Install:
+      brew install dsc                                # one-time
+      cp launchd/net.medarov.docspell.backup.plist ~/Library/LaunchAgents/
+      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/net.medarov.docspell.backup.plist
+
+  Schedule: every Sunday at 03:00 local time.
+
+  Output: ~/Backups/docspell/<yyyy-mm-dd>/   (one dated subdir per run)
+
+  Retention: keep the last 12 backups (≈ 3 months). Older folders deleted.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>net.medarov.docspell.backup</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string><![CDATA[
+      set -euo pipefail
+      DOCSPELL_PASSWORD=$(security find-generic-password -s docspell -a library/dmedarov -w)
+      export DOCSPELL_PASSWORD
+      target="$HOME/Backups/docspell/$(date +%Y-%m-%d)"
+      mkdir -p "$target"
+      echo "[$(date)] starting weekly backup to $target"
+      /opt/homebrew/bin/dsc -d https://docspell.medarov.net \
+        login -u library/dmedarov -p "$DOCSPELL_PASSWORD"
+      /opt/homebrew/bin/dsc -d https://docspell.medarov.net \
+        export --target "$target" --all
+      # Retention: keep the most recent 12 dated dirs
+      cd "$HOME/Backups/docspell"
+      ls -1d 20*/ 2>/dev/null | sort -r | tail -n +13 | xargs -r rm -rf
+      echo "[$(date)] backup finished — kept $(ls -1d 20*/ 2>/dev/null | wc -l) snapshots"
+    ]]></string>
+  </array>
+
+  <key>StandardOutPath</key>
+  <string>/Users/dmedarov/Library/Logs/docspell-backup.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/dmedarov/Library/Logs/docspell-backup.log</string>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key>
+    <integer>0</integer>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>
