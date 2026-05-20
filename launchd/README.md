@@ -13,8 +13,11 @@ Three scheduled tasks that automate routine maintenance:
 ```bash
 cd ~/CODING/Docspell
 
-# Backup needs dsc — install once
-brew install dsc
+# Backup needs dsc — install once (NOT in Homebrew; download from GitHub)
+curl -fL -o /tmp/dsc \
+  https://github.com/docspell/dsc/releases/latest/download/dsc_darwin-0.11.0 \
+  && chmod +x /tmp/dsc && mv /tmp/dsc /opt/homebrew/bin/dsc
+dsc --version    # should print: dsc 0.11.0
 
 # Ensure Docspell + Gmail passwords are stored in keychain (run if not done)
 security add-generic-password -s docspell        -a library/dmedarov         -w

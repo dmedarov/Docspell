@@ -22,6 +22,9 @@
     <string>DOCSPELL_PASSWORD=$(security find-generic-password -s docspell -a library/dmedarov -w) /opt/homebrew/bin/python3 /Users/dmedarov/CODING/Docspell/auto_confirm.py --apply --confirm AUTO-CONFIRM</string>
   </array>
 
+  <key>WorkingDirectory</key>
+  <string>/Users/dmedarov/CODING/Docspell</string>
+
   <key>StandardOutPath</key>
   <string>/Users/dmedarov/Library/Logs/docspell-auto-confirm.log</string>
   <key>StandardErrorPath</key>

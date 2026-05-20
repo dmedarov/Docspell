@@ -25,18 +25,17 @@
     <string>-lc</string>
     <string><![CDATA[
       set -euo pipefail
-      DOCSPELL_PASSWORD=$(security find-generic-password -s docspell -a library/dmedarov -w)
-      export DOCSPELL_PASSWORD
+      export DSC_PASSWORD=$(security find-generic-password -s docspell -a library/dmedarov -w)
       target="$HOME/Backups/docspell/$(date +%Y-%m-%d)"
       mkdir -p "$target"
       echo "[$(date)] starting weekly backup to $target"
-      /opt/homebrew/bin/dsc -d https://docspell.medarov.net \
-        login -u library/dmedarov -p "$DOCSPELL_PASSWORD"
-      /opt/homebrew/bin/dsc -d https://docspell.medarov.net \
+      /opt/homebrew/bin/dsc --docspell-url https://docspell.medarov.net \
+        login -u library/dmedarov
+      /opt/homebrew/bin/dsc --docspell-url https://docspell.medarov.net \
         export --target "$target" --all
       # Retention: keep the most recent 12 dated dirs
       cd "$HOME/Backups/docspell"
-      ls -1d 20*/ 2>/dev/null | sort -r | tail -n +13 | xargs -r rm -rf
+      ls -1d 20*/ 2>/dev/null | sort -r | tail -n +13 | xargs -I{} rm -rf {}
       echo "[$(date)] backup finished — kept $(ls -1d 20*/ 2>/dev/null | wc -l) snapshots"
     ]]></string>
   </array>
