@@ -593,19 +593,23 @@ def build_report(
     total_items = len(all_items)
 
     # 8. Items with book_year
-    # Docspell 0.43.0 query language for custom fields:
-    #   `f.book_year>0`           → ParseFailure (expects `:` after name)
-    #   `customfield.book_year>0` → ParseFailure (unknown prefix)
-    #   `exist:f.book_year`       → ParseFailure (exist: only for relationships)
-    #   `f.book_year:>0`          → works (colon + operator + value)
-    # If even this fails, fall back to the apply-enrichment-log.csv count.
+    # Docspell v0.43.0 query language for custom fields (corrected 2026-05-21):
+    #   - `f:NAME<OP><VALUE>` is the correct syntax. The `f:` prefix uses a
+    #     colon and the field name comes WITHOUT a dot; then the operator
+    #     and value follow with NO colon in between.
+    #     ✓ `f:book_year>0`    (works)
+    #     ✓ `f:book_year:*`    (wildcard, "exists" semantics)
+    #     ✗ `f.book_year:>0`   (ParseFailure — earlier doc was wrong)
+    #     ✗ `f:book_year:>0`   (ParseFailure — operator after the colon)
+    #   - `f.id:<FIELD_ID>:<VALUE>` is the by-id equivalent.
+    # If the live query fails, fall back to the apply-enrichment-log.csv count.
     n_with_book_year = 0
     try:
         items_with_book_year = search_items(
-            base_url, token, "f.book_year:>0", limit=500, max_items=5000
+            base_url, token, "f:book_year>0", limit=200, max_items=5000
         )
         n_with_book_year = len(items_with_book_year)
-        sources.append("GET /sec/item/search?q=f.book_year:>0")
+        sources.append("GET /sec/item/search?q=f:book_year>0")
     except Exception as exc:
         # Fall back: count items with book_year from the apply-enrichment log.
         try:

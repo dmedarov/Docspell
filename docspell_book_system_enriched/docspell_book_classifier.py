@@ -949,12 +949,20 @@ class OnlineBookEnricher:
             return self.cache[key].get("result")
 
         candidates: list[dict[str, Any]] = []
+        # Tag each provider's candidates so the merge below can compose a
+        # single best result with the richest available data.
+        ol_cands: list[dict[str, Any]] = []
+        gb_cands: list[dict[str, Any]] = []
+        ch_cands: list[dict[str, Any]] = []
         if self.providers in ("both", "all", "openlibrary"):
-            candidates.extend(self.query_open_library(title, author))
+            ol_cands = self.query_open_library(title, author)
+            candidates.extend(ol_cands)
         if self.providers in ("both", "all", "googlebooks"):
-            candidates.extend(self.query_google_books(title, author))
+            gb_cands = self.query_google_books(title, author)
+            candidates.extend(gb_cands)
         if self.providers in ("all", "chitanka"):
-            candidates.extend(self.query_chitanka(title, author))
+            ch_cands = self.query_chitanka(title, author)
+            candidates.extend(ch_cands)
 
         best: Optional[dict[str, Any]] = None
         best_score = 0.0
@@ -971,6 +979,48 @@ class OnlineBookEnricher:
             result = dict(best)
             result["match_score"] = best_score
             result["match_reason"] = best_reason
+            # ----- 3-source MERGE -----
+            # For every per-source list (OL/GB/Chitanka), find the
+            # highest-scoring candidate that has a NON-EMPTY value for
+            # each metadata field. The "winning" source dictates
+            # title/authors (already done above by `best`), but
+            # year/isbn/publisher are filled from whichever source
+            # actually has them, even if it scored lower. This lets a
+            # Chitanka-best result keep an OL/GB year, etc.
+            def _score_source(c):
+                s, _ = score_online_candidate(title, author, c)
+                return s
+            scored_lists = [
+                sorted(((c, _score_source(c)) for c in cands), key=lambda kv: -kv[1])
+                for cands in (ol_cands, gb_cands, ch_cands)
+                if cands
+            ]
+            def _best_with_field(field: str) -> Any:
+                """Return value of `field` from the highest-scoring candidate
+                across all 3 sources that actually has it (non-empty)."""
+                best_val = ""
+                best_s = -1.0
+                for scored in scored_lists:
+                    for c, s in scored:
+                        v = c.get(field)
+                        if v and s > best_s:
+                            best_val = v
+                            best_s = s
+                            break  # take the top-scored from this list
+                return best_val
+            merged_year = _best_with_field("year")
+            merged_publisher = _best_with_field("publisher")
+            merged_isbn13 = _best_with_field("isbn13")
+            merged_isbns = _best_with_field("isbns")
+            # Only OVERLAY if the winner doesn't have the field
+            if not result.get("year") and merged_year:
+                result["year"] = merged_year
+            if not result.get("publisher") and merged_publisher:
+                result["publisher"] = merged_publisher
+            if not result.get("isbn13") and merged_isbn13:
+                result["isbn13"] = merged_isbn13
+            if not result.get("isbns") and merged_isbns:
+                result["isbns"] = merged_isbns
         else:
             self.stats["miss"] += 1
 
