@@ -489,6 +489,12 @@ class DocspellClient:
 
     def login(self, account: str, password: str | None = None) -> None:
         if password is None:
+            # Honor DOCSPELL_PASSWORD env var for non-interactive runs (nohup,
+            # cron, CI). Falls back to interactive prompt only if env var is
+            # not set.
+            import os
+            password = os.environ.get("DOCSPELL_PASSWORD")
+        if password is None:
             password = getpass.getpass("Docspell password: ")
         res = self.request("POST", "/open/auth/login", {"account": account, "password": password, "rememberMe": False}, auth=False)
         if not res.get("success"):
@@ -904,6 +910,8 @@ class OnlineBookEnricher:
         self.last_call = 0.0
         self.stats = {"cache_hit": 0, "miss": 0, "openlibrary": 0, "googlebooks": 0}
         self.cache: dict[str, Any] = {}
+        self._writes_since_flush = 0
+        self._flush_every = 10   # save_cache() every N new API calls
         if cache_path.exists():
             try:
                 self.cache = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -970,6 +978,18 @@ class OnlineBookEnricher:
             "query_author": author,
             "result": result,
         }
+        # Incremental persistence + progress so a long run can be resumed
+        # if it's interrupted, and so the user sees progress in real time.
+        self._writes_since_flush += 1
+        total = len(self.cache)
+        marker = "+" if result else "−"
+        print(f"[enrich] {marker} {total:4d}/cache  title={title[:55]!r}", flush=True)
+        if self._writes_since_flush >= self._flush_every:
+            try:
+                self.save_cache()
+                self._writes_since_flush = 0
+            except Exception as exc:
+                print(f"[enrich] cache flush failed: {exc}", flush=True)
         return result
 
     def query_open_library(self, title: str, author: str = "") -> list[dict[str, Any]]:
